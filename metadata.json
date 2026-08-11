@@ -1,0 +1,6 @@
+{
+  "name": "Abstract News",
+  "description": "A persistent, mobile-friendly news synthesizer with citation filters, RSS source management, timeframe controls, and topic clustering.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

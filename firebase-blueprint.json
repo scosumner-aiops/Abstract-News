@@ -1,0 +1,22 @@
+{
+  "entities": {
+    "UserSettings": {
+      "title": "UserSettings",
+      "description": "User settings for the application",
+      "type": "object",
+      "properties": {
+        "sources": { "type": "array" },
+        "rules": { "type": "array" },
+        "timeframeValue": { "type": "string" },
+        "showImages": { "type": "boolean" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      }
+    }
+  },
+  "firestore": {
+    "/userSettings/{userKey}": {
+      "schema": "UserSettings",
+      "description": "User settings per user key"
+    }
+  }
+}
