@@ -1,4 +1,4 @@
-import { RawNewsItem, ReplacementRule, SynthesizedArticle } from '../types';
+import { RawNewsItem, ReplacementRule, SynthesizedArticle, TopicPreference } from '../types';
 
 /**
  * Extracts image URLs from article HTML content (OpenGraph, Twitter card, or <img> tags)
@@ -323,20 +323,73 @@ export function fixSentenceStartCapitalization(text: string): string {
 }
 
 /**
- * Formats text into a concise 2-3 sentence summary (max ~280 chars)
+ * Cleans up grammatical and readability glitches from anonymizer replacements,
+ * such as duplicate titles ("U.S. president the U.S. president"),
+ * ungrammatical noun adjuncts ("U.S. president Administration" -> "The U.S. administration"),
+ * double articles ("the the", "a a"), and missing articles for bare singular titles.
+ */
+export function cleanCitationGrammarGlitches(text: string): string {
+  if (!text) return '';
+  let res = text;
+
+  // 1. Redundant / duplicate title sequences (e.g. "U.S. president the U.S. president", "President the U.S. president")
+  res = res.replace(
+    /\b(?:(?:the|The)\s+)?(?:u\.s\.\s+|us\s+|united\s+states\s+)?president\s+(?:the\s+)?(?:u\.s\.\s+|us\s+|united\s+states\s+)?president\b/gi,
+    'the U.S. president'
+  );
+  res = res.replace(/\b(?:(?:the|The)\s+)?president\s+the\s+U\.S\.\s+president\b/gi, 'the U.S. president');
+  res = res.replace(/\b(?:(?:the|The)\s+)?(?:ontario\s+)?premier\s+(?:the\s+)?(?:ontario\s+)?premier\b/gi, 'the premier');
+  res = res.replace(/\b(?:(?:the|The)\s+)?prime\s+minister\s+(?:the\s+)?prime\s+minister\b/gi, 'the prime minister');
+  res = res.replace(/\b(?:(?:the|The)\s+)?(?:ceo|chief\s+executive)\s+(?:the\s+)?(?:ceo|chief\s+executive)\b/gi, 'the chief executive');
+
+  // 2. Noun adjunct glitches (e.g. "U.S. president Administration", "the U.S. president Administration")
+  res = res.replace(/\b(?:the\s+)?(?:u\.s\.\s+|us\s+|united\s+states\s+)?president\s+(?:Administration|administration)\b/gi, 'the U.S. administration');
+  res = res.replace(/\b(?:the\s+)?(?:u\.s\.\s+|us\s+|united\s+states\s+)?president\s+campaign\b/gi, 'the presidential campaign');
+  res = res.replace(/\b(?:the\s+)?(?:u\.s\.\s+|us\s+|united\s+states\s+)?president\s+cabinet\b/gi, 'the presidential cabinet');
+  res = res.replace(/\b(?:the\s+)?(?:u\.s\.\s+|us\s+|united\s+states\s+)?president\s+officials\b/gi, 'U.S. administration officials');
+  res = res.replace(
+    /\b(?:the\s+)?(?:u\.s\.\s+|us\s+|united\s+states\s+)?president\s+(team|transition\s+team|aides|advisers|advisors|allies|policies|policy|doctrine|orders?|lawyers|attorneys|spokesperson|spokespeople|spokesman|spokeswoman)\b/gi,
+    "the U.S. president's $1"
+  );
+
+  // 3. Premier / Prime Minister / Leader noun adjunct glitches (e.g. "the premier government", "the premier policies")
+  res = res.replace(/\b(?:the\s+)?(?:ontario\s+)?premier\s+(government|cabinet|team|officials|policies|policy)\b/gi, "the premier's $1");
+  res = res.replace(/\b(?:the\s+)?prime\s+minister\s+(government|cabinet|team|officials|policies|policy)\b/gi, "the prime minister's $1");
+
+  // 4. Double / clashing determiners (e.g. "the the", "a a", "the a", "a the")
+  res = res.replace(/\b(the|The)\s+(?:the|The)\b/g, '$1');
+  res = res.replace(/\b(a|A)\s+(?:a|A)\b/g, '$1');
+  res = res.replace(/\b(an|An)\s+(?:an|An)\b/g, '$1');
+  res = res.replace(/\b(?:the|The)\s+(?:a|an)\b/g, 'the');
+  res = res.replace(/\b(?:a|A)\s+the\b/g, 'the');
+
+  // 5. Bare singular titles at sentence start or start of string missing article "The"
+  // E.g. "U.S. president took to social media...", "U.S. president signed...", "U.S. administration moves..."
+  res = res.replace(
+    /(^|[\.\!\?\n\r:]+\s*["'“‘\(\[]*)U\.S\.\s+president\s+(took|said|announced|stated|signed|met|spoke|visited|declared|posted|criticized|praised|defended|warned|threatened|called|vowed|issued|nominated|appointed|ordered|arrived|rejected|urged|approved|attended|headed|hosted|confirmed|traveled|faces|signals|moves)\b/gi,
+    (match, prefix, verb) => `${prefix}The U.S. president ${verb}`
+  );
+  res = res.replace(/(^|[\.\!\?\n\r:]+\s*["'“‘\(\[]*)U\.S\.\s+administration\b/gi, (match, prefix) => `${prefix}The U.S. administration`);
+
+  // 6. Sentence start capitalization
+  return fixSentenceStartCapitalization(res.trim());
+}
+
+/**
+ * Formats text into a concise, punchy 1-2 sentence summary (max ~280 chars)
  */
 export function formatConciseSummary(str: string): string {
   if (!str) return '';
-  const clean = stripHtml(str).replace(/\n+/g, ' ').replace(/\s+/g, ' ').trim();
+  const clean = cleanCitationGrammarGlitches(cleanLiveblogAndRoundupArtifacts(stripHtml(str).replace(/\n+/g, ' ').replace(/\s+/g, ' ').trim()));
   if (!clean) return '';
 
   let summary = clean;
   const sentences = splitIntoSentences(clean);
   if (sentences && sentences.length > 0) {
     let result = '';
-    for (let i = 0; i < Math.min(sentences.length, 3); i++) {
+    for (let i = 0; i < Math.min(sentences.length, 2); i++) {
       const nextSentence = sentences[i];
-      if ((result + ' ' + nextSentence).trim().length > 320 && i >= 1) {
+      if ((result + ' ' + nextSentence).trim().length > 280 && i >= 1) {
         break;
       }
       result = (result + ' ' + nextSentence).trim();
@@ -348,7 +401,7 @@ export function formatConciseSummary(str: string): string {
     summary = (lastSpace > 120 ? sub.substring(0, lastSpace) : sub) + '...';
   }
 
-  return fixSentenceStartCapitalization(summary);
+  return cleanCitationGrammarGlitches(fixSentenceStartCapitalization(summary));
 }
 
 /**
@@ -479,7 +532,10 @@ export function applyReplacements(text: string, rules: ReplacementRule[]): strin
   let result = text;
   const activeRules = rules.filter((r) => r.enabled && r.term.trim().length > 0);
 
-  activeRules.forEach((rule) => {
+  // Sort rules by term length descending so longer phrases match first (e.g., "Donald Trump" before "Trump")
+  const sortedRules = [...activeRules].sort((a, b) => b.term.trim().length - a.term.trim().length);
+
+  sortedRules.forEach((rule) => {
     const rawTerm = rule.term.trim();
     const rawReplacement = rule.replacement.trim();
     if (!rawTerm) return;
@@ -487,73 +543,123 @@ export function applyReplacements(text: string, rules: ReplacementRule[]): strin
     // 1. Strip possessive suffixes from term and replacement to obtain clean base words
     // Handles straight ('), curly (’), backtick (`), left single quote (‘)
     const cleanTerm = rawTerm.replace(/['’'‘\`]s?$/i, '').trim();
-    const cleanReplacement = rawReplacement.replace(/['’'‘\`]s?$/i, '').trim();
+    let cleanReplacement = rawReplacement.replace(/['’'‘\`]s?$/i, '').trim();
 
-    if (!cleanTerm) return;
+    if (!cleanTerm || !cleanReplacement) return;
 
-    // 2. Build regex pattern for cleanTerm that allows optional apostrophe variations and possessive/plural suffixes
+    // Ensure titles used as singular noun phrases have a natural leading article if missing
+    if (/^(?:u\.s\.\s+|us\s+|united\s+states\s+)?president\b/i.test(cleanReplacement) && !/^(?:the|a|an)\b/i.test(cleanReplacement)) {
+      cleanReplacement = 'the ' + cleanReplacement;
+    } else if (/^(?:ontario\s+)?premier\b/i.test(cleanReplacement) && !/^(?:the|a|an)\b/i.test(cleanReplacement)) {
+      cleanReplacement = 'the ' + cleanReplacement;
+    } else if (/^prime\s+minister\b/i.test(cleanReplacement) && !/^(?:the|a|an)\b/i.test(cleanReplacement)) {
+      cleanReplacement = 'the ' + cleanReplacement;
+    }
+
+    // 2. Build regex pattern for cleanTerm that allows optional title prefixes, apostrophe variations, possessive/plural suffixes,
+    // and trailing noun adjuncts (e.g., "Trump Administration", "Trump campaign", "Trump officials", "Trump team")
     const escapedCleanTerm = cleanTerm
       .replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
       .replace(/['’'‘\`]/g, "['’'‘\\`]");
 
-    // Regex explanation:
-    // \\b${escapedCleanTerm} matches the base term at a word boundary
-    // (?:(['’'‘\`]s)|(['’'‘\`])|(s['’'‘\`])|(s))? matches optional possessive or plural suffixes:
-    //   Group 1: 's or ’s (singular possessive)
-    //   Group 2: ' or ’ (possessive marker)
-    //   Group 3: s' or s’ (plural possessive)
-    //   Group 4: s (plural)
-    // (?![a-zA-Z0-9_]) ensures we don't match mid-word
+    // Title prefixes that precede people's names in news reporting
+    const titlePrefixPattern = `(?:(?:(?:the|a|an)\\s+)?(?:(?:former|ex-?)\\s+)?(?:u\\.s\\.\\s+|us\\s+|united\s+states\\s+|ontario\\s+|california\\s+)?(?:president|vice\\s+president|premier|prime\\s+minister|governor|mayor|senator|representative|congressman|congresswoman|minister|chancellor|secretary|ceo|chief\\s+executive|director|chairman|chairwoman)\\s+|mr\\.\\s+|mrs\\.\\s+|ms\\.\\s+|dr\\.\\s+)`;
+
+    // Attributive noun adjuncts that follow leaders' names without apostrophes
+    const adjunctSuffixPattern = `(?:\\s+(administration|government|campaign|cabinet|white\\s+house|officials|official|aides|aide|advisers|advisors|adviser|advisor|team|transition\\s+team|allies|ally|supporters|supporter|critics|critic|policies|policy|doctrine|orders?|lawyers|attorneys|spokesperson|spokespeople|spokesman|spokeswoman))`;
+
     const regex = new RegExp(
-      `\\b${escapedCleanTerm}(?:(['’'‘\`]s)|(['’'‘\`])|(s['’'‘\`])|(s))?(?![a-zA-Z0-9_])`,
+      `(${titlePrefixPattern})?\\b${escapedCleanTerm}(?:(['’'‘\`]s)|(['’'‘\`])|(s['’'‘\`])|(s))?${adjunctSuffixPattern}?(?![a-zA-Z0-9_])`,
       'gi'
     );
 
-    result = result.replace(regex, (match, g1PossessiveS, g2Apostrophe, g3PluralPossessive, g4Plural, offset, fullString) => {
-      // Determine if match is at sentence start
-      const prefix = fullString.slice(0, offset);
-      const isStartOfSentence =
-        offset === 0 ||
-        /[\.\!\?\n\r:]\s*["'“‘\(\[]*$/.test(prefix) ||
-        /^\s*$/.test(prefix);
+    result = result.replace(
+      regex,
+      (match, capturedPrefix, g1PossessiveS, g2Apostrophe, g3PluralPossessive, g4Plural, capturedAdjunct, offset, fullString) => {
+        // Determine if match is at sentence start
+        const prefix = fullString.slice(0, offset);
+        const isStartOfSentence =
+          offset === 0 ||
+          /[\.\!\?\n\r:]\s*["'“‘\(\[]*$/.test(prefix) ||
+          /^\s*$/.test(prefix);
 
-      let targetReplacement = cleanReplacement;
+        let targetReplacement = cleanReplacement;
 
-      // Determine grammatical form based on captured suffix groups or original rule
-      const hasPossessiveInText = Boolean(g1PossessiveS || g2Apostrophe || g3PluralPossessive);
-      const hasPossessiveInRule = /['’'‘\`]s?$/i.test(rawReplacement) || /['’'‘\`]s?$/i.test(rawTerm);
+        const hasPossessiveInText = Boolean(g1PossessiveS || g2Apostrophe || g3PluralPossessive);
+        const hasPossessiveInRule = /['’'‘\`]s?$/i.test(rawReplacement) || /['’'‘\`]s?$/i.test(rawTerm);
 
-      if (hasPossessiveInText || hasPossessiveInRule) {
-        // Form possessive of cleanReplacement
-        if (cleanReplacement.length > 0) {
+        if (capturedAdjunct) {
+          const adj = capturedAdjunct.toLowerCase();
+          if (adj === 'administration') {
+            if (/president/i.test(cleanReplacement)) {
+              targetReplacement = 'the U.S. administration';
+            } else {
+              targetReplacement = `${cleanReplacement}'s administration`;
+            }
+          } else if (adj === 'campaign') {
+            if (/president/i.test(cleanReplacement)) {
+              targetReplacement = 'the presidential campaign';
+            } else {
+              targetReplacement = `${cleanReplacement}'s campaign`;
+            }
+          } else if (adj === 'cabinet') {
+            if (/president/i.test(cleanReplacement)) {
+              targetReplacement = 'the presidential cabinet';
+            } else {
+              targetReplacement = `${cleanReplacement}'s cabinet`;
+            }
+          } else if (adj === 'officials' || adj === 'official') {
+            if (/president/i.test(cleanReplacement)) {
+              targetReplacement = adj === 'officials' ? 'U.S. administration officials' : 'a U.S. administration official';
+            } else {
+              targetReplacement = `${cleanReplacement}'s ${capturedAdjunct}`;
+            }
+          } else if (adj === 'government') {
+            if (/premier|ontario/i.test(cleanReplacement)) {
+              targetReplacement = 'the Ontario government';
+            } else {
+              targetReplacement = `${cleanReplacement}'s government`;
+            }
+          } else {
+            // Team, allies, policy, doctrine, order, etc.
+            const basePossessive = /[s|z|x]$/i.test(cleanReplacement)
+              ? `${cleanReplacement}'`
+              : `${cleanReplacement}'s`;
+            targetReplacement = `${basePossessive} ${capturedAdjunct}`;
+          }
+        } else if (hasPossessiveInText || hasPossessiveInRule) {
+          // Form possessive of cleanReplacement
           if (/[s|z|x]$/i.test(cleanReplacement)) {
             targetReplacement = `${cleanReplacement}'`;
           } else {
             targetReplacement = `${cleanReplacement}'s`;
           }
-        }
-      } else if (g4Plural) {
-        // Form simple plural of cleanReplacement if matched plural suffix 's'
-        if (cleanReplacement.length > 0) {
+        } else if (g4Plural) {
+          // Form simple plural of cleanReplacement if matched plural suffix 's'
           if (/[s|x|z|ch|sh]$/i.test(cleanReplacement)) {
             targetReplacement = `${cleanReplacement}es`;
           } else {
             targetReplacement = `${cleanReplacement}s`;
           }
         }
-      }
 
-      if (targetReplacement.length > 0 && isStartOfSentence) {
-        // Capitalize first character of replacement at sentence start
-        targetReplacement = targetReplacement.charAt(0).toUpperCase() + targetReplacement.slice(1);
-      }
+        // Avoid double determiners if preceding text ends with "the" or "The"
+        if (/\b(?:the|The)\s+$/.test(prefix) && /^(?:the|The)\s+/i.test(targetReplacement)) {
+          targetReplacement = targetReplacement.replace(/^(?:the|The)\s+/i, '');
+        }
 
-      return targetReplacement;
-    });
+        if (targetReplacement.length > 0 && isStartOfSentence) {
+          // Capitalize first character of replacement at sentence start
+          targetReplacement = targetReplacement.charAt(0).toUpperCase() + targetReplacement.slice(1);
+        }
+
+        return targetReplacement;
+      }
+    );
   });
 
-  // Post-processing pass to guarantee all sentence/paragraph starts are properly capitalized
-  result = fixSentenceStartCapitalization(result);
+  // Post-processing pass to guarantee all grammar glitches, double titles, and sentence starts are properly normalized
+  result = cleanCitationGrammarGlitches(result);
 
   return result;
 }
@@ -695,7 +801,16 @@ export function cleanLiveblogAndRoundupArtifacts(text: string): string {
   // Strips liveblog transitions like "Back to Ukraine, where Nine people...", "Back to Glasgow, where..."
   cleaned = cleaned.replace(/\bBack to [A-Z][a-zA-Z\s\-]+,\s*where\b[^\.\!\?\n]*[\.\!\?]?/g, '');
 
-  // Strips generic boilerplate summary lines & hardcoded wrap-ups
+  // Strips generic filler, empty clichés, and wordy transitional phrases
+  cleaned = cleaned.replace(/\bIt remains to be seen (whether|if)[^\.\!\?\n]*[\.\!\?]?/gi, '');
+  cleaned = cleaned.replace(/\bOnly time will tell (whether|if|how)[^\.\!\?\n]*[\.\!\?]?/gi, '');
+  cleaned = cleaned.replace(/\bIn a dramatic turn of events,?\s*/gi, '');
+  cleaned = cleaned.replace(/\bAs events continue to unfold,?\s*/gi, '');
+  cleaned = cleaned.replace(/\bAs developments unfold,?\s*/gi, '');
+  cleaned = cleaned.replace(/\bAgainst the backdrop of [^,.]*,\s*/gi, '');
+  cleaned = cleaned.replace(/\bHighlighting the broader significance[^\.\!\?\n]*[\.\!\?]?/gi, '');
+  cleaned = cleaned.replace(/\bThis development comes as[^\.\!\?\n]*[\.\!\?]?/gi, '');
+  cleaned = cleaned.replace(/\bThis comes at a (crucial|critical) juncture[^\.\!\?\n]*[\.\!\?]?/gi, '');
   cleaned = cleaned.replace(/\bIndustry analysts and affected parties are closely observing[^\.\!\?\n]*[\.\!\?]?/gi, '');
   cleaned = cleaned.replace(/\bJournalists and news outlets including [^.]+ continue tracking[^\.\!\?\n]*[\.\!\?]?/gi, '');
   cleaned = cleaned.replace(/\bKey stakeholders and officials continue to review[^\.\!\?\n]*[\.\!\?]?/gi, '');
@@ -858,6 +973,8 @@ export function mergeDuplicateSynthesizedArticles(articles: SynthesizedArticle[]
         sourceLinks: combinedSourceLinks,
         images: combinedImages,
         articleCount: target.articleCount + art.articleCount,
+        topicTag: target.topicTag || art.topicTag,
+        matchedTopic: target.matchedTopic || art.matchedTopic,
       };
     } else {
       merged.push({ ...art });
@@ -1065,7 +1182,18 @@ export function sanitizeArticleDetailsParagraphs(
     // 2. If this paragraph contains the summary or title
     if (alphaSummary && alphaP.length >= alphaSummary.length && alphaP.includes(alphaSummary)) continue;
 
-    // 3. Sentence level duplication check
+    // 3. Duplication check against previously added paragraphs in result (no repeated topics)
+    const isTopicRepeat = result.some(prevP => {
+      const alphaPrev = normAlpha(prevP);
+      if (alphaPrev.length >= 30 && alphaP.length >= 30) {
+        if (alphaPrev.includes(alphaP) || alphaP.includes(alphaPrev)) return true;
+        if (alphaPrev.slice(0, 35) === alphaP.slice(0, 35)) return true;
+      }
+      return false;
+    });
+    if (isTopicRepeat) continue;
+
+    // 4. Sentence level duplication check
     const pSentences = splitIntoSentences(p);
     const nonDupSentences: string[] = [];
 
@@ -1080,23 +1208,30 @@ export function sanitizeArticleDetailsParagraphs(
       if (alphaSummary && alphaSent.length > 20 && alphaSummary.includes(alphaSent.slice(0, 20))) continue;
       if (alphaTitle && alphaTitle.includes(alphaSent)) continue;
 
+      // Ensure this sentence wasn't already included in earlier paragraphs
+      const sentRepeatedInResult = result.some(prevP => {
+        const alphaPrev = normAlpha(prevP);
+        return alphaPrev.includes(alphaSent) || (alphaSent.length > 25 && alphaPrev.includes(alphaSent.slice(0, 25)));
+      });
+      if (sentRepeatedInResult) continue;
+
       nonDupSentences.push(sent);
     }
 
     if (nonDupSentences.length === 0) continue;
 
-    const cleanP = cleanQuotesAndFormatting(nonDupSentences.join(' '));
+    const cleanP = cleanCitationGrammarGlitches(cleanQuotesAndFormatting(nonDupSentences.join(' ')));
     const wordsInP = cleanP.split(/\s+/).filter(Boolean).length;
 
-    // 100-200 words target limit: stop if totalWords reaches 150-200 words
-    if (totalWords >= 150 && result.length >= 2) {
+    // High information density target: up to 350 substantive words across up to 4 paragraphs
+    if (totalWords >= 320 && result.length >= 2) {
       break;
     }
 
     result.push(cleanP);
     totalWords += wordsInP;
 
-    if (totalWords >= 200) {
+    if (totalWords >= 400 || result.length >= 4) {
       break;
     }
   }
@@ -1130,7 +1265,8 @@ export function synthesizeLocalFallback(
   items: RawNewsItem[],
   rules: ReplacementRule[],
   timeframeHours: number,
-  primarySourceName?: string
+  primarySourceName?: string,
+  topics?: TopicPreference[]
 ): SynthesizedArticle[] {
   const now = new Date().getTime();
   const cutoff = now - timeframeHours * 60 * 60 * 1000;
@@ -1203,10 +1339,10 @@ export function synthesizeLocalFallback(
       });
     });
 
-    const cleanTitle = stripHtml(cleanLiveblogAndRoundupArtifacts(applyReplacements(mainItem.title, rules)));
+    const cleanTitle = cleanCitationGrammarGlitches(stripHtml(cleanLiveblogAndRoundupArtifacts(applyReplacements(mainItem.title, rules))));
     const rawMainDescClean = cleanLiveblogAndRoundupArtifacts(mainItem.description || '');
     const rawMainDesc = applyReplacements(rawMainDescClean, rules);
-    const cleanSummary = formatConciseSummary(rawMainDesc);
+    const cleanSummary = cleanCitationGrammarGlitches(formatConciseSummary(rawMainDesc));
 
     // Collect descriptions across cluster items WITHOUT prepending titles
     const allClusterTexts = cluster.items
@@ -1245,6 +1381,37 @@ export function synthesizeLocalFallback(
     const sanitizedP = sanitizeArticleDetailsParagraphs(rawFullText, cleanTitle, cleanSummary);
     const cleanFullDetails = sanitizedP.join('\n\n');
 
+    // Topic weighting and tagging for local fallback
+    const activeTopics = (topics || []).filter(t => t.enabled && t.topic.trim().length > 0);
+    const seeMore = activeTopics.filter(t => t.weight === 'more');
+    const seeLess = activeTopics.filter(t => t.weight === 'less');
+
+    let topicTag: 'Following' | 'Occasional' | undefined = undefined;
+    let matchedTopic: string | undefined = undefined;
+
+    const lowerTitle = cleanTitle.toLowerCase();
+    const lowerSummary = cleanSummary.toLowerCase();
+
+    for (const sm of seeMore) {
+      const term = sm.topic.toLowerCase().trim();
+      if (lowerTitle.includes(term) || lowerSummary.includes(term)) {
+        topicTag = 'Following';
+        matchedTopic = sm.topic.trim();
+        break;
+      }
+    }
+
+    if (!topicTag) {
+      for (const sl of seeLess) {
+        const term = sl.topic.toLowerCase().trim();
+        if (lowerTitle.includes(term) || lowerSummary.includes(term)) {
+          topicTag = 'Occasional';
+          matchedTopic = sl.topic.trim();
+          break;
+        }
+      }
+    }
+
     return {
       id: `synth-${index}-${Date.now()}`,
       title: cleanTitle,
@@ -1256,8 +1423,17 @@ export function synthesizeLocalFallback(
       timestamp: mainItem.pubDate,
       articleCount: cluster.items.length,
       category: 'General News',
+      topicTag,
+      matchedTopic,
     };
   }).filter(art => hasSufficientArticleDetails(art.fullDetails, art.title, art.summary));
+
+  // Prioritize 'Following' articles, balance neutral articles, and place 'Occasional' articles lower
+  initialSynthesized.sort((a, b) => {
+    const scoreA = a.topicTag === 'Following' ? 2 : a.topicTag === 'Occasional' ? 0 : 1;
+    const scoreB = b.topicTag === 'Following' ? 2 : b.topicTag === 'Occasional' ? 0 : 1;
+    return scoreB - scoreA;
+  });
 
   return mergeDuplicateSynthesizedArticles(initialSynthesized).slice(0, 25);
 }

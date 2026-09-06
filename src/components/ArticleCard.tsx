@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Layers, Clock, ExternalLink, Tag, Plus, Minus, BookOpen } from 'lucide-react';
+import { Layers, Clock, ExternalLink, Tag, Plus, Minus, BookOpen, TrendingUp, SlidersHorizontal } from 'lucide-react';
 import { ReplacementRule, SynthesizedArticle } from '../types';
 import { ImageCarousel } from './ImageCarousel';
 import { stripHtml, formatConciseSummary, ensureParagraphBreaks, sanitizeArticleDetailsParagraphs } from '../utils/rss';
@@ -68,6 +68,26 @@ export const ArticleCard: React.FC<ArticleCardProps> = ({
               <span className="inline-flex items-center space-x-1 text-[11px] font-semibold text-emerald-300 bg-emerald-950/60 border border-emerald-800/60 px-2 py-0.5 rounded-md">
                 <Layers className="w-3 h-3 text-emerald-400" />
                 <span>Combined {article.articleCount} feeds</span>
+              </span>
+            )}
+
+            {article.topicTag === 'Following' && (
+              <span
+                className="inline-flex items-center space-x-1 text-[11px] font-semibold text-emerald-300 bg-emerald-950/90 border border-emerald-700/80 px-2 py-0.5 rounded-md shadow-xs"
+                title={article.matchedTopic ? `Following boosted topic: ${article.matchedTopic}` : 'Following boosted topic'}
+              >
+                <TrendingUp className="w-3 h-3 text-emerald-400" />
+                <span>Following{article.matchedTopic ? `: ${article.matchedTopic}` : ''}</span>
+              </span>
+            )}
+
+            {article.topicTag === 'Occasional' && (
+              <span
+                className="inline-flex items-center space-x-1 text-[11px] font-semibold text-amber-300 bg-amber-950/90 border border-amber-700/80 px-2 py-0.5 rounded-md shadow-xs"
+                title={article.matchedTopic ? `Occasional de-prioritized topic: ${article.matchedTopic}` : 'Occasional de-prioritized topic'}
+              >
+                <SlidersHorizontal className="w-3 h-3 text-amber-400" />
+                <span>Occasional{article.matchedTopic ? `: ${article.matchedTopic}` : ''}</span>
               </span>
             )}
           </div>

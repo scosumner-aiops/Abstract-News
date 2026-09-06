@@ -3,64 +3,178 @@ import path from 'path';
 import fs from 'fs';
 import session from 'express-session';
 import cookieParser from 'cookie-parser';
-import { initializeApp } from 'firebase/app';
-import { getFirestore, doc, getDoc, setDoc, deleteDoc } from 'firebase/firestore';
 import { createServer as createViteServer } from 'vite';
 import { GoogleGenAI, Type } from '@google/genai';
 
-class DocRef {
-  constructor(private db: any, private col: string, private docId: string) {}
-  async get() {
-    const snap = await getDoc(doc(this.db, this.col, this.docId));
+function jsToFirestoreValue(val: any): any {
+  if (val === null || val === undefined) {
+    return { nullValue: "NULL_VALUE" };
+  }
+  if (typeof val === 'boolean') {
+    return { booleanValue: val };
+  }
+  if (typeof val === 'number') {
+    if (Number.isInteger(val)) {
+      return { integerValue: String(val) };
+    }
+    return { doubleValue: val };
+  }
+  if (typeof val === 'string') {
+    return { stringValue: val };
+  }
+  if (Array.isArray(val)) {
     return {
-      exists: snap.exists(),
-      data: () => snap.data()
+      arrayValue: {
+        values: val.map(jsToFirestoreValue)
+      }
     };
   }
-  async set(data: any) {
-    await setDoc(doc(this.db, this.col, this.docId), data);
+  if (typeof val === 'object') {
+    const fields: Record<string, any> = {};
+    for (const [k, v] of Object.entries(val)) {
+      if (v !== undefined) {
+        fields[k] = jsToFirestoreValue(v);
+      }
+    }
+    return { mapValue: { fields } };
   }
-  async delete() {
-    await deleteDoc(doc(this.db, this.col, this.docId));
-  }
+  return { stringValue: String(val) };
 }
 
-class ColRef {
-  constructor(private db: any, private col: string) {}
-  doc(docId: string) {
-    return new DocRef(this.db, this.col, docId);
+function firestoreValueToJs(val: any): any {
+  if (!val) return null;
+  if ('stringValue' in val) return val.stringValue;
+  if ('booleanValue' in val) return val.booleanValue;
+  if ('integerValue' in val) return parseInt(val.integerValue, 10);
+  if ('doubleValue' in val) return parseFloat(val.doubleValue);
+  if ('nullValue' in val) return null;
+  if ('arrayValue' in val) {
+    const values = val.arrayValue?.values || [];
+    return values.map(firestoreValueToJs);
   }
+  if ('mapValue' in val) {
+    const fields = val.mapValue?.fields || {};
+    const res: Record<string, any> = {};
+    for (const [k, v] of Object.entries(fields)) {
+      res[k] = firestoreValueToJs(v);
+    }
+    return res;
+  }
+  return null;
 }
 
-class DbWrapper {
-  constructor(private db: any) {}
-  collection(col: string) {
-    return new ColRef(this.db, col);
-  }
-}
+let firestoreConfig: any = null;
 
-let db: any = null;
-
-function getDb(): any {
-  if (!db) {
-    let config: any = {};
+function getFirestoreConfig() {
+  if (!firestoreConfig) {
     try {
-      config = JSON.parse(fs.readFileSync(path.join(process.cwd(), 'firebase-applet-config.json'), 'utf8'));
+      firestoreConfig = JSON.parse(fs.readFileSync(path.join(process.cwd(), 'firebase-applet-config.json'), 'utf8'));
     } catch (e) {
       console.warn('Failed to read firebase-applet-config.json:', e);
+      firestoreConfig = {};
     }
-    const app = initializeApp(config);
-    const dbId = config.firestoreDatabaseId || config.databaseId || 'ai-studio-abstractnews-5dac5c76-1bd6-4159-9e3f-fb2da2d47328';
-    const rawDb = getFirestore(app, dbId);
-    db = new DbWrapper(rawDb);
   }
-  return db;
+  return {
+    projectId: firestoreConfig.projectId || 'lucky-blend-9wjkk',
+    apiKey: firestoreConfig.apiKey || '',
+    databaseId: firestoreConfig.firestoreDatabaseId || firestoreConfig.databaseId || 'ai-studio-abstractnews-5dac5c76-1bd6-4159-9e3f-fb2da2d47328',
+  };
+}
+
+class FirestoreDocRef {
+  constructor(private collectionName: string, private docId: string) {}
+
+  private getDocUrl() {
+    const { projectId, databaseId, apiKey } = getFirestoreConfig();
+    return `https://firestore.googleapis.com/v1/projects/${projectId}/databases/${databaseId}/documents/${this.collectionName}/${encodeURIComponent(this.docId)}?key=${apiKey}`;
+  }
+
+  async get() {
+    try {
+      const url = this.getDocUrl();
+      const res = await fetch(url);
+      if (res.status === 404) {
+        return { exists: false, data: () => null };
+      }
+      if (!res.ok) {
+        const errText = await res.text();
+        console.error(`Firestore REST GET error (${res.status}):`, errText);
+        return { exists: false, data: () => null };
+      }
+      const docJson = await res.json();
+      const data = firestoreValueToJs({ mapValue: { fields: docJson.fields || {} } });
+      return {
+        exists: true,
+        data: () => data
+      };
+    } catch (err) {
+      console.error(`Firestore REST GET failed for ${this.docId}:`, err);
+      return { exists: false, data: () => null };
+    }
+  }
+
+  async set(data: any, options?: { merge?: boolean }) {
+    try {
+      let url = this.getDocUrl();
+      const keys = Object.keys(data);
+      for (const key of keys) {
+        // Enclose key in backticks if it contains spaces or special characters
+        const fieldPath = key.includes(' ') || key.includes('-') || key.includes('.') ? `\`${key}\`` : key;
+        url += `&updateMask.fieldPaths=${encodeURIComponent(fieldPath)}`;
+      }
+      const fields = jsToFirestoreValue(data).mapValue?.fields || {};
+      const res = await fetch(url, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ fields })
+      });
+      if (!res.ok) {
+        const errText = await res.text();
+        console.error(`Firestore REST SET error (${res.status}):`, errText);
+      }
+    } catch (err) {
+      console.error(`Firestore REST SET failed for ${this.docId}:`, err);
+    }
+  }
+
+  async delete() {
+    try {
+      const url = this.getDocUrl();
+      const res = await fetch(url, { method: 'DELETE' });
+      if (!res.ok && res.status !== 404) {
+        const errText = await res.text();
+        console.error(`Firestore REST DELETE error (${res.status}):`, errText);
+      }
+    } catch (err) {
+      console.error(`Firestore REST DELETE failed for ${this.docId}:`, err);
+    }
+  }
+}
+
+class FirestoreCollectionRef {
+  constructor(private collectionName: string) {}
+  doc(docId: string) {
+    return new FirestoreDocRef(this.collectionName, docId);
+  }
+}
+
+class FirestoreDbClient {
+  collection(collectionName: string) {
+    return new FirestoreCollectionRef(collectionName);
+  }
+}
+
+const dbClient = new FirestoreDbClient();
+
+function getDb(): any {
+  return dbClient;
 }
 import {
   parseRssXml,
   extractImagesFromArticleHtml,
   synthesizeLocalFallback,
   applyReplacements,
+  cleanCitationGrammarGlitches,
   isImageMatchingRules,
   stripHtml,
   formatConciseSummary,
@@ -73,7 +187,8 @@ import {
   sanitizeArticleDetailsParagraphs,
   hasSufficientArticleDetails
 } from './src/utils/rss';
-import { RawNewsItem, ReplacementRule, SynthesizedArticle } from './src/types';
+import { RawNewsItem, ReplacementRule, SynthesizedArticle, TopicPreference } from './src/types';
+import { DEFAULT_SOURCES, DEFAULT_RULES, DEFAULT_TOPIC_PREFERENCES } from './src/utils/defaultSettings';
 
 declare module 'express-session' {
   interface SessionData {
@@ -161,137 +276,19 @@ async function startServer() {
     try {
       console.log('Initializing default settings...');
       const defaultDoc = await getDb().collection('userSettings').doc('default_settings').get();
-      const defaultSources = [
-        {
-          id: 'globo-g1',
-          name: 'Globo (G1)',
-          url: 'https://g1.globo.com/rss/g1/',
-          enabled: true,
-          tags: ['Headlines']
-        },
-        {
-          id: 'the-guardian',
-          name: 'The Guardian',
-          url: 'https://www.theguardian.com/world/rss',
-          enabled: true,
-          tags: ['Headlines']
-        },
-        {
-          id: 'reuters',
-          name: 'Reuters',
-          url: 'https://reuters.com',
-          enabled: true,
-          tags: ['Headlines']
-        },
-        {
-          id: 'al-jazeera',
-          name: 'Al Jazeera English',
-          url: 'https://www.aljazeera.com/xml/rss/all.xml',
-          enabled: true,
-          tags: ['Headlines']
-        },
-        {
-          id: 'associated-press',
-          name: 'Associated Press',
-          url: 'https://apnews.com',
-          enabled: true,
-          tags: ['Headlines']
-        },
-        {
-          id: 'deutsche-welle',
-          name: 'Deutsche Welle (DW)',
-          url: 'https://rss.dw.com/xml/rss-en-all',
-          enabled: true,
-          tags: ['Headlines']
-        },
-        {
-          id: 'france-24',
-          name: 'France 24',
-          url: 'https://www.france24.com/en/rss',
-          enabled: true,
-          tags: ['Headlines']
-        },
-        {
-          id: 'the-independent',
-          name: 'The Independent',
-          url: 'https://www.independent.co.uk/news/rss',
-          enabled: true,
-          tags: ['Headlines']
-        },
-        {
-          id: 'la-presse',
-          name: 'La Presse',
-          url: 'https://www.lapresse.ca/actualites/rss',
-          enabled: true,
-          tags: ['Headlines']
-        },
-        {
-          id: 'global-news',
-          name: 'Global News Canada',
-          url: 'https://globalnews.ca/feed/',
-          enabled: true,
-          tags: ['Headlines']
-        },
-        {
-          id: 'cbc-news',
-          name: 'CBC News',
-          url: 'https://www.cbc.ca/cmlink/rss-topstories',
-          enabled: true,
-          tags: ['Headlines']
-        },
-        {
-          id: 'national-post',
-          name: 'National Post',
-          url: 'https://nationalpost.com/category/news/feed',
-          enabled: true,
-          tags: ['Headlines']
-        },
-        {
-          id: 'montreal-gazette',
-          name: 'Montreal Gazette',
-          url: 'https://news.google.com/rss/search?q=site:montrealgazette.com&hl=en-CA&gl=CA&ceid=CA:en',
-          enabled: true,
-          tags: ['Headlines']
-        }
-      ];
-
-      const defaultRules = [
-        {
-          id: 'rule-1',
-          term: 'Doug Ford',
-          replacement: 'the premier of Ontario',
-          enabled: true,
-        },
-        {
-          id: 'rule-2',
-          term: 'Tesla',
-          replacement: 'a leading U.S. electric automaker',
-          enabled: true,
-        },
-        {
-          id: 'rule-3',
-          term: 'Donald Trump',
-          replacement: 'the U.S. president',
-          enabled: true,
-        },
-        {
-          id: 'rule-4',
-          term: 'Elon Musk',
-          replacement: 'a prominent tech mogul',
-          enabled: true,
-        }
-      ];
-
-      // Always update default_settings template in Firestore to reflect latest sources & rules
-      await getDb().collection('userSettings').doc('default_settings').set({
-        sources: defaultSources,
-        rules: defaultRules,
-        timeframeValue: '24',
-        showImages: true,
-        selectedModel: 'gemini-3.5-lite',
-        updatedAt: new Date().toISOString(),
-      });
-      console.log('Default settings successfully updated in Firestore.');
+      if (!defaultDoc.exists || !Array.isArray(defaultDoc.data()?.sources) || defaultDoc.data().sources.length === 0) {
+        await getDb().collection('userSettings').doc('default_settings').set({
+          sources: DEFAULT_SOURCES,
+          rules: DEFAULT_RULES,
+          topicPreferences: DEFAULT_TOPIC_PREFERENCES,
+          timeframeValue: '24',
+          showImages: true,
+          selectedModel: 'gemini-3.5-lite',
+          primarySourceId: 'none',
+          updatedAt: new Date().toISOString(),
+        });
+        console.log('Default settings successfully initialized in Firestore.');
+      }
     } catch (err) {
       console.error('Failed to initialize default settings in Firestore:', err);
     }
@@ -301,11 +298,21 @@ async function startServer() {
   async function loadDefaultSettings() {
     try {
       const doc = await getDb().collection('userSettings').doc('default_settings').get();
-      return doc.exists ? doc.data() : null;
+      if (doc.exists && Array.isArray(doc.data()?.sources) && doc.data().sources.length > 0) {
+        return doc.data();
+      }
     } catch (err) {
       console.error('Failed to read defaultSettings from Firestore:', err);
-      return null;
     }
+    return {
+      sources: DEFAULT_SOURCES,
+      rules: DEFAULT_RULES,
+      topicPreferences: DEFAULT_TOPIC_PREFERENCES,
+      timeframeValue: '24',
+      showImages: true,
+      selectedModel: 'gemini-3.5-lite',
+      primarySourceId: 'none',
+    };
   }
 
   async function loadUserSettingsForGoogleUser(email: string): Promise<any> {
@@ -316,17 +323,34 @@ async function startServer() {
 
       if (doc.exists) {
         const data = doc.data() || {};
-        // Ensure "Google user" field is stored in plain text
+        let needsSave = false;
+        if (!Array.isArray(data.sources) || data.sources.length === 0) {
+          const defaultSettings = await loadDefaultSettings();
+          data.sources = defaultSettings.sources || DEFAULT_SOURCES;
+          needsSave = true;
+        }
+        if (!Array.isArray(data.rules)) {
+          const defaultSettings = await loadDefaultSettings();
+          data.rules = defaultSettings.rules || DEFAULT_RULES;
+          needsSave = true;
+        }
+        if (!Array.isArray(data.topicPreferences)) {
+          data.topicPreferences = [];
+          needsSave = true;
+        }
         if (data['Google user'] !== cleanEmail) {
-          await docRef.set({ ...data, 'Google user': cleanEmail }, { merge: true }).catch(() => {});
           data['Google user'] = cleanEmail;
+          needsSave = true;
+        }
+        if (needsSave) {
+          await docRef.set({ ...data, 'Google user': cleanEmail }, { merge: true }).catch(() => {});
         }
         return data;
       }
 
       // First time login for this Google user: preload with default_settings from Firestore
       console.log(`Preloading new Firestore document for first-time Google user: ${cleanEmail}`);
-      const defaultSettings = (await loadDefaultSettings()) || {};
+      const defaultSettings = await loadDefaultSettings();
 
       const newDocData = {
         ...defaultSettings,
@@ -340,7 +364,7 @@ async function startServer() {
       return newDocData;
     } catch (err) {
       console.error(`Failed to load/initialize settings for ${cleanEmail}:`, err);
-      const defaultSettings = (await loadDefaultSettings()) || {};
+      const defaultSettings = await loadDefaultSettings();
       return { ...defaultSettings, 'Google user': cleanEmail };
     }
   }
@@ -348,6 +372,10 @@ async function startServer() {
   async function saveUserSettingsForGoogleUser(email: string, settings: any) {
     const cleanEmail = email.toLowerCase().trim();
     try {
+      // Ensure we don't save empty sources list unless explicitly intended
+      if (!Array.isArray(settings.sources) || settings.sources.length === 0) {
+        settings.sources = DEFAULT_SOURCES;
+      }
       await getDb().collection('userSettings').doc(cleanEmail).set(
         {
           ...settings,
@@ -759,7 +787,8 @@ Respond ONLY with valid JSON:
   app.get('/api/user/settings', async (req, res) => {
     const user = getUserFromReq(req);
     if (!user || !user.email) {
-      return res.status(401).json({ error: 'Authentication required. Please sign in with Google.' });
+      const defaultSettings = await loadDefaultSettings();
+      return res.json({ settings: defaultSettings, userKey: 'guest', isGuest: true });
     }
 
     const email = user.email.toLowerCase().trim();
@@ -831,30 +860,41 @@ Respond ONLY with valid JSON:
     const normUrl = (urlStr || '').toLowerCase();
 
     if (normName.includes('independent') || normUrl.includes('independent.co.uk')) {
-      return ['https://www.independent.co.uk/news/rss', 'https://www.independent.co.uk/rss'];
+      return [
+        'https://www.independent.co.uk/news/rss',
+        'https://www.independent.co.uk/rss',
+        'https://news.google.com/rss/search?q=site:independent.co.uk&hl=en-GB&gl=GB&ceid=GB:en'
+      ];
     }
     if (normName.includes('la presse') || normName.includes('lapresse') || normUrl.includes('lapresse.ca')) {
       return [
         'https://www.lapresse.ca/actualites/rss',
         'https://www.lapresse.ca/manchettes/rss',
-        'https://www.lapresse.ca/international/rss'
+        'https://www.lapresse.ca/international/rss',
+        'https://news.google.com/rss/search?q=site:lapresse.ca&hl=fr&gl=CA&ceid=CA:fr'
       ];
     }
     if (normName.includes('global news') || normUrl.includes('globalnews.ca')) {
-      return ['https://globalnews.ca/feed/', 'https://globalnews.ca/canada/feed/'];
+      return [
+        'https://globalnews.ca/feed/',
+        'https://globalnews.ca/canada/feed/',
+        'https://news.google.com/rss/search?q=site:globalnews.ca&hl=en-CA&gl=CA&ceid=CA:en'
+      ];
     }
     if (normName.includes('cbc') || normUrl.includes('cbc.ca')) {
       return [
         'https://www.cbc.ca/cmlink/rss-topstories',
         'https://www.cbc.ca/cmlink/rss-canada',
-        'https://rss.cbc.ca/lineup/topstories.xml'
+        'https://rss.cbc.ca/lineup/topstories.xml',
+        'https://news.google.com/rss/search?q=site:cbc.ca&hl=en-CA&gl=CA&ceid=CA:en'
       ];
     }
     if (normName.includes('national post') || normUrl.includes('nationalpost.com')) {
       return [
         'https://nationalpost.com/category/news/feed',
         'https://nationalpost.com/feed',
-        'https://nationalpost.com/rss'
+        'https://nationalpost.com/rss',
+        'https://news.google.com/rss/search?q=site:nationalpost.com&hl=en-CA&gl=CA&ceid=CA:en'
       ];
     }
     if (normName.includes('montreal gazette') || normUrl.includes('montrealgazette.com')) {
@@ -864,25 +904,45 @@ Respond ONLY with valid JSON:
       ];
     }
     if (normName.includes('globo') || normUrl.includes('globo.com')) {
-      return ['https://g1.globo.com/rss/g1/'];
+      return [
+        'https://g1.globo.com/rss/g1/',
+        'https://news.google.com/rss/search?q=site:g1.globo.com&hl=pt-BR&gl=BR&ceid=BR:pt'
+      ];
     }
     if (normName.includes('guardian') || normUrl.includes('theguardian.com')) {
-      return ['https://www.theguardian.com/world/rss'];
+      return [
+        'https://www.theguardian.com/world/rss',
+        'https://news.google.com/rss/search?q=site:theguardian.com&hl=en-GB&gl=GB&ceid=GB:en'
+      ];
     }
     if (normName.includes('reuters') || normUrl.includes('reuters.com')) {
-      return ['https://news.google.com/rss/search?q=site:reuters.com&hl=en-US&gl=US&ceid=US:en'];
+      return [
+        'https://news.google.com/rss/search?q=site:reuters.com&hl=en-US&gl=US&ceid=US:en'
+      ];
     }
     if (normName.includes('associated press') || normUrl.includes('apnews.com') || normName === 'ap news') {
-      return ['https://news.google.com/rss/search?q=site:apnews.com&hl=en-US&gl=US&ceid=US:en'];
+      return [
+        'https://news.google.com/rss/search?q=site:apnews.com&hl=en-US&gl=US&ceid=US:en'
+      ];
     }
     if (normName.includes('deutsche welle') || normName === 'dw' || normUrl.includes('dw.com')) {
-      return ['https://rss.dw.com/xml/rss-en-all', 'https://rss.dw.com/rdf/rss-en-all'];
+      return [
+        'https://rss.dw.com/xml/rss-en-all',
+        'https://rss.dw.com/rdf/rss-en-all',
+        'https://news.google.com/rss/search?q=site:dw.com&hl=en-US&gl=US&ceid=US:en'
+      ];
     }
     if (normName.includes('france 24') || normUrl.includes('france24.com')) {
-      return ['https://www.france24.com/en/rss'];
+      return [
+        'https://www.france24.com/en/rss',
+        'https://news.google.com/rss/search?q=site:france24.com&hl=en-US&gl=US&ceid=US:en'
+      ];
     }
     if (normName.includes('al jazeera') || normUrl.includes('aljazeera.com')) {
-      return ['https://www.aljazeera.com/xml/rss/all.xml'];
+      return [
+        'https://www.aljazeera.com/xml/rss/all.xml',
+        'https://news.google.com/rss/search?q=site:aljazeera.com&hl=en-US&gl=US&ceid=US:en'
+      ];
     }
 
     return [];
@@ -910,11 +970,31 @@ Respond ONLY with valid JSON:
     try {
       // 1. Check priority direct feed URLs
       const priorityCandidates = resolveDirectFeedUrls(sourceName, urlStr);
-      for (const targetUrl of priorityCandidates) {
-        const directRes = await tryFetch(targetUrl);
-        if (directRes.text) {
-          const items = parseRssXml(directRes.text, sourceName, urlStr);
-          if (items.length > 0) return items;
+      if (priorityCandidates.length > 0) {
+        const fetchPromises = priorityCandidates.map(async (targetUrl) => {
+          const directRes = await tryFetch(targetUrl);
+          if (directRes.text) {
+            return parseRssXml(directRes.text, sourceName, urlStr);
+          }
+          return [];
+        });
+
+        const results = await Promise.all(fetchPromises);
+        const allMergedItems: RawNewsItem[] = [];
+        const seenLinks = new Set<string>();
+
+        results.forEach((items) => {
+          items.forEach((item) => {
+            const cleanLink = (item.link || '').trim().toLowerCase();
+            if (cleanLink && !seenLinks.has(cleanLink)) {
+              seenLinks.add(cleanLink);
+              allMergedItems.push(item);
+            }
+          });
+        });
+
+        if (allMergedItems.length > 0) {
+          return allMergedItems;
         }
       }
 
@@ -1234,9 +1314,10 @@ Return JSON with a "translations" array containing objects with "id", "title", a
   // 3. Synthesize & Anonymize API Endpoint
   app.post('/api/synthesize', async (req, res) => {
     try {
-      const { items, rules = [], timeframeHours = 24, selectedModel = 'gemini-3.5-lite', primarySourceName } = req.body as {
+      const { items, rules = [], topics = [], timeframeHours = 24, selectedModel = 'gemini-3.5-lite', primarySourceName } = req.body as {
         items: RawNewsItem[];
         rules: ReplacementRule[];
+        topics?: TopicPreference[];
         timeframeHours: number;
         selectedModel?: string;
         primarySourceName?: string;
@@ -1266,6 +1347,9 @@ Return JSON with a "translations" array containing objects with "id", "title", a
           }));
 
           const activeRules = rules.filter(r => r.enabled && r.term.trim().length > 0);
+          const activeTopics = (topics || []).filter(t => t.enabled && t.topic && t.topic.trim().length > 0);
+          const seeMoreTopics = activeTopics.filter(t => t.weight === 'more').map(t => t.topic.trim());
+          const seeLessTopics = activeTopics.filter(t => t.weight === 'less').map(t => t.topic.trim());
 
           let systemInstruction = `You are a world-class executive news editor and synthesizer.
 Your task:
@@ -1276,18 +1360,60 @@ Your task:
    - You MUST NEVER mix, concatenate, or blend unrelated news events, different sports matches, or separate geopolitical stories into the same article, summary, or fullDetails body.
    - LIVEBLOG / ROUNDUP CLEANUP: Raw feed entries may contain live blogs or roundups with transition phrases (e.g., "Back to Ukraine, where...", "In other news...", "Here are this week's other releases...", "Meanwhile...", "Live updates:"). You MUST extract ONLY the primary main story topic of that entry and COMPLETELY STRIP/REMOVE all unrelated side updates, transition sentences, secondary product announcements, or off-topic roundup lists.
 
-3. CONCISE FULL ARTICLE BREAKDOWN REQUIREMENT (CRITICAL):
-   - 'summary' MUST be a brief 2-3 sentence executive overview card (max 30-50 words) that directly summarizes the actual factual news story event itself.
-   - NO MEDIA PLAYER BOILERPLACE OR SYSTEM NOTICES (CRITICAL): Raw RSS feeds frequently contain embedded audio/video player text or browser warnings (e.g. "Listen to this article...", "The audio version of this article is generated by AI...", "To play this video you need to enable JavaScript..."). You MUST COMPLETELY EXCLUDE all media player notices, audio disclaimers, video player warnings, and JavaScript messages from 'summary' and 'fullDetails'. Every summary MUST be a real, factual summary of the news story event itself.
-   - 'fullDetails' MUST be a concise, focused detailed breakdown (~100-200 words total, approx 2 to 3 short paragraphs) providing deeper background context, key developments, timelines, and implications without forbidden citations.
-   - DO NOT REPEAT THE HEADLINE OR SUMMARY IN 'fullDetails': 'fullDetails' MUST BE THE CONTINUATION of the article only. DO NOT include the article title/headline or summary paragraph at the top or anywhere inside 'fullDetails'. It MUST start directly with deeper background context and detailed developments.
-   - NO IMAGE CAPTIONS, CITATIONS, OR METADATA (CRITICAL): Never include phrases like "Image source, Reuters", "Photo credit", "Published 4 hours ago", or isolated subheadings/questions in 'fullDetails'.
-   - NO GENERIC FILLER OR SOURCE EXPLANATIONS: Do not include meta-comments explaining the synthesis or pointing to sources. End naturally with concrete story details.
+3. SIMPLIFIED, DIRECT LANGUAGE & HIGH-DENSITY REPORTING (CRITICAL):
+   a. PLAIN, DIRECT LANGUAGE — NO WORDINESS, NO FILLER:
+      - Write in clean, straightforward, plain English. Get straight to the point.
+      - Use active voice and crisp, concise sentences. Avoid passive, winding phrasing.
+      - ELIMINATE EMPTY FILLER AND JOURNALISTIC CLICHES: Do NOT use phrases like "In a dramatic turn of events", "This development comes as", "It remains to be seen", "Observers note that", "Highlighting the broader significance", "Against the backdrop of", "Taking center stage", "Amid growing tensions".
+      - State facts, actions, and consequences plainly without preamble or decorative fluff.
 
-4. MANDATORY ENTITY ANONYMIZATION / CITATION FILTER:
-   You MUST NEVER mention or cite any of the following restricted terms or individuals anywhere in your generated titles or summaries:
-${activeRules.map(r => `   - Forbidden: "${r.term}" -> Replace with: "${r.replacement}"`).join('\n')}
-   Instead of using the prohibited name/citation, describe who or what they are naturally in context (e.g. replace "Doug Ford" with "the premier of Ontario" or "the government of Ontario"; replace "Tesla" with "a leading U.S. electric automaker"). Ensure proper capitalization when substituting text at the start of sentences. The sentence must remain grammatically smooth and natural.
+   b. SUMMARY CARD: CONCISE, PUNCHY, AND TO THE POINT:
+      - 'summary' MUST be a crisp 1 to 2 sentence executive card (approx 25 to 45 words).
+      - Directly state: Who did what, where, and the immediate outcome.
+      - Zero fluff, zero preamble, zero wordiness.
+
+   c. 'SHOW MORE' (fullDetails): MORE FACTS AND INSIGHTS, NOT MORE WORDS:
+      - Focus on high factual density rather than word volume. Do NOT pad with fluff, wordy exposition, or repetitive restatements.
+      - Provide 2 to 4 tight, substantive paragraphs (approx 180 to 300 words total) separated by double linebreaks (\n\n).
+      - PACK EVERY PARAGRAPH WITH CONCRETE DETAILS:
+        * Hard numbers, percentages, dollar figures, casualty/damage metrics, vote tallies, and dates.
+        * Specific names, titles, government agencies, courts, and corporate entities.
+        * Official policy decisions, regulatory actions, treaty articles, or contractual terms.
+        * Direct, verifiable quotes and explicit statements from key stakeholders.
+      - DELIVER MEANINGFUL INSIGHTS (THE "WHY" AND "WHAT'S NEXT"):
+        * Explain underlying drivers, geopolitical or market catalysts, and strategic motivations.
+        * Outline concrete upcoming milestones: scheduled votes, court hearings, appeals, regulatory deadlines, or operational next steps.
+      - STRICT ZERO-REPETITION MANDATE (NO REPEAT TOPICS / NO ECHOING):
+        * 'fullDetails' MUST NEVER repeat, rephrase, or re-state what was already stated in the headline or the summary.
+        * It MUST start immediately with deeper factual context and chronological developments.
+        * Each subsequent paragraph in 'fullDetails' MUST address a fresh, distinct aspect (e.g., Paragraph 1: Hard figures & timeline; Paragraph 2: Conflicting stakeholder statements & official quotes; Paragraph 3: Strategic insights & next milestones). Never circle back to repeat earlier points.
+      - NO MEDIA PLAYER NOTICES OR SYSTEM TEXT: Completely strip all audio/video player text (e.g., "Listen to this article", "To play this video enable JavaScript").
+      - NO METADATA OR CAPTIONS: Never include photo credits, time stamps, or isolated subheadings.
+      - NO GENERIC FILLER OR SOURCE EXPLANATIONS: Do not include meta-comments explaining the synthesis or pointing to sources. End naturally with concrete facts.
+
+4. TARGETED REPLACEMENT RULES & MANDATORY NAMING OF ALL NON-RESTRICTED ENTITIES (CRITICAL):
+   a. STRICT TARGETED REPLACEMENTS & FLAWLESS GRAMMATICAL INTEGRATION:
+      You MUST ONLY replace terms that match the following specific forbidden rules:
+${activeRules.map(r => `      * Replace: "${r.term}" -> With: "${r.replacement}"`).join('\n')}
+      Instead of using the prohibited name/citation, describe who or what they are naturally in context (e.g. replace "Doug Ford" with "the premier of Ontario" or "the government of Ontario"; replace "Tesla" with "a leading U.S. electric automaker").
+      
+      GRAMMATICAL INTEGRATION RULES (STRICTLY AVOID GLITCHES):
+      - DO NOT DUPLICATE TITLES: If the raw feed has an honorific or title before the name (e.g., "U.S. President Donald Trump", "President Trump", "Ontario Premier Doug Ford"), DO NOT write "U.S. president the U.S. president" or "President the U.S. president". Replace the entire combination with the natural substitute: "The U.S. president took to social media...", "The premier of Ontario announced...".
+      - PROPER NOUN ADJUNCT & ATTRIBUTIVE GRAMMAR:
+        * NEVER write "U.S. president Administration", "the U.S. president Administration", "the U.S. president campaign", or "the U.S. president officials".
+        * For administrations: write "the U.S. administration", "the presidential administration", or "the U.S. president's administration".
+        * For campaigns and cabinets: write "the presidential campaign", "the presidential cabinet", or "the U.S. president's campaign".
+        * For teams, officials, policies, and orders: write "the U.S. president's team", "administration officials", "the U.S. president's policies", or "the presidential order".
+      - AVOID DOUBLE ARTICLES: Never write "the the U.S. president" or "a the".
+      - PROPER SENTENCE CAPITALIZATION: Ensure proper capitalization when substituting text at the start of sentences (e.g., "The U.S. president announced...", "The U.S. administration stated..."). The sentence must remain grammatically smooth, readable, and natural.
+
+   b. MANDATORY NAMING OF COUNTRIES, PEOPLE, CITIES & NON-BLOCKED ENTITIES (DO NOT MAKE ABSTRACT):
+      - CRITICAL: You are STRICTLY FORBIDDEN from generalizing, omitting, or anonymizing any country, city, person, politician, government leader, company, or institution that is NOT on the forbidden list above!
+      - PRESERVE REAL COUNTRIES AND NATIONS: ALWAYS explicitly name countries (e.g., Ukraine, United Kingdom, Canada, France, Germany, China, Japan, United States, Israel, Brazil). Do NOT abstract them as "a European country", "a North American nation", "a neighbouring state", or "an overseas ally".
+      - PRESERVE REAL CITIES & REGIONS: ALWAYS explicitly name cities, provinces, and regions (e.g., London, Montreal, Toronto, Kyiv, Paris, Berlin, Ottawa, Tokyo, Gaza, Washington). Do NOT abstract them as "a major city", "a regional capital", or "an urban center".
+      - PRESERVE REAL PEOPLE & OFFICIALS: If a person (e.g., Keir Starmer, Emmanuel Macron, Volodymyr Zelenskyy, Mark Carney, or any other official or individual) is NOT on the forbidden list, YOU MUST EXPLICITLY NAME THEM with their actual name and real title. Do NOT say "a European leader", "a foreign minister", "a prominent politician", or "authorities".
+      - PRESERVE REAL COMPANIES & ORGANIZATIONS: Unless a specific company or organization is explicitly on the block list, name them directly (e.g., Apple, Boeing, NATO, the United Nations, FIFA, OpenAI, etc.).
+      - WRITE CONCRETE, VIVID, FACTUAL JOURNALISM: The articles must be specific, grounded, and factual, never vague or abstract. Only replace the specific terms explicitly listed in the replacement rules above.
 
 5. Plain Text Formatting:
    You MUST NEVER output HTML tags (such as <p>, <a>, <div>, <br>, <span>) anywhere in returned title, summary, or fullDetails fields. All text must be clean, readable plain text.
@@ -1295,8 +1421,19 @@ ${activeRules.map(r => `   - Forbidden: "${r.term}" -> Replace with: "${r.replac
 6. Return valid JSON adhering strictly to the schema provided.
 Include "matchedItemIds" as an array of numerical IDs corresponding ONLY to input items that report on that EXACT same specific story.`;
 
+          if (activeTopics.length > 0) {
+            systemInstruction += `\n\n7. TOPIC WEIGHTING & EDITORIAL PRIORITIES (CRITICAL):
+The user has configured explicit topic weights for story selection and curation. This is NOT a binary exclusion filter, but an editorial weighting directive:
+${seeMoreTopics.length > 0 ? `- "SEE MORE OF" (BOOSTED / FOLLOWING) TOPICS:
+${seeMoreTopics.map(t => `  * "${t}": Actively prioritize, feature, and synthesize stories covering this subject. Dedicate candidate article slots to cohesive, high-quality coverage of this topic whenever available in the raw news feeds. For any synthesized story covering this topic, set "topicTag": "Following" and "matchedTopic": "${t}".`).join('\n')}` : ''}
+${seeLessTopics.length > 0 ? `- "SEE LESS OF" (DE-PRIORITIZED / OCCASIONAL) TOPICS:
+${seeLessTopics.map(t => `  * "${t}": De-emphasize and downweight coverage on this subject. Do NOT select routine or run-of-the-mill stories on this topic. ONLY select a story on this topic if it represents an exceptionally major, landmark, or critical breaking development, keeping appearances rare and occasional. For any synthesized story selected from this topic, set "topicTag": "Occasional" and "matchedTopic": "${t}".`).join('\n')}` : ''}
+- NEUTRAL / UNLISTED TOPICS:
+  Synthesize with standard, balanced editorial judgment. Set "topicTag": "" and "matchedTopic": "".`;
+          }
+
           if (primarySourceName) {
-            systemInstruction += `\n\n7. CRITICAL PRIMARY ANCHOR MANDATE:
+            systemInstruction += `\n\n8. CRITICAL PRIMARY ANCHOR MANDATE:
 - Your primary anchor news source is "${primarySourceName}".
 - Every single synthesized article you generate MUST be anchored in "${primarySourceName}". This means it must report on a news event that is actually covered by at least one feed entry from "${primarySourceName}".
 - You are STRONGLY FORBIDDEN from generating any synthesized article that does NOT have "${primarySourceName}" as one of its sources.
@@ -1326,12 +1463,14 @@ Include "matchedItemIds" as an array of numerical IDs corresponding ONLY to inpu
                         items: {
                           type: Type.OBJECT,
                           properties: {
-                            title: { type: Type.STRING, description: 'Headline story title without forbidden citations' },
-                            summary: { type: Type.STRING, description: 'Concise 2-3 sentence executive summary without forbidden citations' },
-                            fullDetails: { type: Type.STRING, description: 'Comprehensive full-length article breakdown with 3 to 5 detailed paragraphs separated by linebreaks, providing background context, key developments, timelines, stakeholder perspectives, and implications without forbidden citations' },
+                            title: { type: Type.STRING, description: 'Direct, crisp headline without forbidden citations' },
+                            summary: { type: Type.STRING, description: 'Direct 1-2 sentence executive summary (25-45 words) in plain, simple English. Strictly to the point: who did what, where, and the immediate outcome. Zero filler.' },
+                            fullDetails: { type: Type.STRING, description: 'High-density factual breakdown in 2 to 4 tight, substantive paragraphs (180-300 words total) separated by double linebreaks. Focus on MORE FACTS and INSIGHTS (concrete figures, dates, verified quotes, underlying drivers, next milestones), NOT MORE WORDS. Zero filler, and strictly NO repetition of the headline or summary.' },
                             sources: { type: Type.ARRAY, items: { type: Type.STRING }, description: 'Names of news sources covering this story' },
                             category: { type: Type.STRING, description: 'Category like World, Tech, Politics, Business' },
                             matchedItemIds: { type: Type.ARRAY, items: { type: Type.INTEGER }, description: 'List of matching input item IDs' },
+                            topicTag: { type: Type.STRING, description: 'Must be "Following" if this story covers a boosted topic, "Occasional" if it covers a de-prioritized topic, or empty string if neutral' },
+                            matchedTopic: { type: Type.STRING, description: 'The exact matched topic name if topicTag is Following or Occasional, else empty string' },
                           },
                           required: ['title', 'summary', 'fullDetails', 'sources', 'matchedItemIds'],
                         },
@@ -1381,15 +1520,15 @@ Include "matchedItemIds" as an array of numerical IDs corresponding ONLY to inpu
                 })).filter((link, i, self) => i === self.findIndex(l => l.url === link.url));
 
                 // Clean title, summary, and fullDetails extra safeguard with local replacement and HTML stripping
-                const cleanTitle = stripHtml(cleanLiveblogAndRoundupArtifacts(applyReplacements(art.title, rules)));
-                let cleanSummary = cleanMediaAudioVideoJunk(formatConciseSummary(cleanLiveblogAndRoundupArtifacts(applyReplacements(art.summary, rules))));
+                const cleanTitle = cleanCitationGrammarGlitches(stripHtml(cleanLiveblogAndRoundupArtifacts(applyReplacements(art.title, rules))));
+                let cleanSummary = cleanCitationGrammarGlitches(cleanMediaAudioVideoJunk(formatConciseSummary(cleanLiveblogAndRoundupArtifacts(applyReplacements(art.summary, rules)))));
                 if (!cleanSummary && matchedItems.length > 0) {
                   const firstDesc = cleanMediaAudioVideoJunk(stripHtml(matchedItems[0].description || ''));
-                  cleanSummary = firstDesc ? splitIntoSentences(firstDesc)[0] || cleanTitle : cleanTitle;
+                  cleanSummary = cleanCitationGrammarGlitches(firstDesc ? splitIntoSentences(firstDesc)[0] || cleanTitle : cleanTitle);
                 }
                 const rawFullText = art.fullDetails ? cleanMediaAudioVideoJunk(applyReplacements(art.fullDetails, rules)) : '';
                 const sanitizedP = sanitizeArticleDetailsParagraphs(rawFullText, cleanTitle, cleanSummary);
-                let cleanFullDetails = sanitizedP.join('\n\n');
+                let cleanFullDetails = cleanCitationGrammarGlitches(sanitizedP.join('\n\n'));
 
                 // Guarantee proper minimum length and multi-paragraph coverage for fullDetails without title/summary repetition
                 if (cleanFullDetails.trim().length < 200) {
@@ -1424,7 +1563,7 @@ Include "matchedItemIds" as an array of numerical IDs corresponding ONLY to inpu
                     });
                     const extraSanitized = sanitizeArticleDetailsParagraphs(extraParagraphs.join('\n\n'), cleanTitle, cleanSummary);
                     if (extraSanitized.length > 0) {
-                      cleanFullDetails = extraSanitized.join('\n\n');
+                      cleanFullDetails = cleanCitationGrammarGlitches(extraSanitized.join('\n\n'));
                     }
                   }
                 }
@@ -1432,6 +1571,10 @@ Include "matchedItemIds" as an array of numerical IDs corresponding ONLY to inpu
                 const latestTimestamp = matchedItems.length > 0
                   ? matchedItems[0].pubDate
                   : new Date().toISOString();
+
+                const rawTopicTag = art.topicTag ? String(art.topicTag).trim() : '';
+                const topicTag = rawTopicTag === 'Following' || rawTopicTag === 'Occasional' ? rawTopicTag : undefined;
+                const matchedTopic = art.matchedTopic ? String(art.matchedTopic).trim() : undefined;
 
                 return {
                   id: `ai-synth-${idx}-${Date.now()}`,
@@ -1444,11 +1587,20 @@ Include "matchedItemIds" as an array of numerical IDs corresponding ONLY to inpu
                   timestamp: latestTimestamp,
                   articleCount: matchedItems.length || 1,
                   category: art.category || 'World News',
+                  topicTag,
+                  matchedTopic: topicTag ? matchedTopic : undefined,
                 };
               }).filter(art => hasSufficientArticleDetails(art.fullDetails, art.title, art.summary));
 
               // Apply post-synthesis duplicate merging pass to combine any remaining overlapping topics
               const deduplicatedArticles = mergeDuplicateSynthesizedArticles(synthesizedArticles).slice(0, 25);
+
+              // Sort articles: boosted 'Following' stories first, then neutral stories, then 'Occasional' stories
+              deduplicatedArticles.sort((a, b) => {
+                const scoreA = a.topicTag === 'Following' ? 2 : a.topicTag === 'Occasional' ? 0 : 1;
+                const scoreB = b.topicTag === 'Following' ? 2 : b.topicTag === 'Occasional' ? 0 : 1;
+                return scoreB - scoreA;
+              });
 
               // Filter article images with Gemini Vision against active rules
               const cleanArticles = await filterArticleImagesWithVision(deduplicatedArticles, rules, ai);
@@ -1469,7 +1621,7 @@ Include "matchedItemIds" as an array of numerical IDs corresponding ONLY to inpu
       }
 
       // Fallback local engine
-      const fallbackArticles = synthesizeLocalFallback(items, rules, timeframeHours);
+      const fallbackArticles = synthesizeLocalFallback(items, rules, timeframeHours, primarySourceName, topics);
       const cleanFallbackArticles = await filterArticleImagesWithVision(fallbackArticles, rules, ai);
       res.json({
         articles: cleanFallbackArticles,

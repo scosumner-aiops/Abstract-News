@@ -31,6 +31,15 @@ export interface SourceLink {
   url: string;
 }
 
+export type TopicWeight = 'more' | 'less';
+
+export interface TopicPreference {
+  id: string;
+  topic: string;
+  weight: TopicWeight;
+  enabled: boolean;
+}
+
 export interface SynthesizedArticle {
   id: string;
   title: string;
@@ -42,6 +51,8 @@ export interface SynthesizedArticle {
   timestamp: string;
   articleCount: number;
   category?: string;
+  topicTag?: 'Following' | 'Occasional' | null;
+  matchedTopic?: string;
 }
 
 export interface UserProfile {
@@ -55,17 +66,21 @@ export interface UserProfile {
 export interface UserSettings {
   sources: NewsSource[];
   rules: ReplacementRule[];
+  topicPreferences?: TopicPreference[];
   timeframeValue: string;
   showImages: boolean;
   selectedModel?: string;
+  primarySourceId?: string;
   updatedAt?: string;
 }
 
 export interface SynthesisRequest {
   items: RawNewsItem[];
   rules: ReplacementRule[];
+  topics?: TopicPreference[];
   timeframeHours: number;
   selectedModel?: string;
+  primarySourceName?: string;
 }
 
 export interface SynthesisResponse {

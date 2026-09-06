@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
-import { X, Rss, ShieldAlert, Sliders, Plus, Trash2, RotateCcw, Check, Sparkles, Tag, User as UserIcon, LogOut, CheckCircle2, Upload, Download } from 'lucide-react';
-import { NewsSource, ReplacementRule, UserProfile } from '../types';
+import { X, Rss, ShieldAlert, Sliders, Plus, Trash2, RotateCcw, Check, Sparkles, Tag, User as UserIcon, LogOut, CheckCircle2, Upload, Download, Compass, TrendingUp, SlidersHorizontal } from 'lucide-react';
+import { NewsSource, ReplacementRule, TopicPreference, TopicWeight, UserProfile } from '../types';
 
 interface ConfigModalProps {
   isOpen: boolean;
@@ -9,6 +9,8 @@ interface ConfigModalProps {
   onUpdateSources: (sources: NewsSource[]) => void;
   rules: ReplacementRule[];
   onUpdateRules: (rules: ReplacementRule[]) => void;
+  topicPreferences: TopicPreference[];
+  onUpdateTopicPreferences: (topics: TopicPreference[]) => void;
   onResetDefaults: () => void;
   onClearCache: () => void;
   onTriggerResynthesize: () => void;
@@ -26,6 +28,8 @@ export const ConfigModal: React.FC<ConfigModalProps> = ({
   onUpdateSources,
   rules,
   onUpdateRules,
+  topicPreferences,
+  onUpdateTopicPreferences,
   onResetDefaults,
   onClearCache,
   onTriggerResynthesize,
@@ -35,7 +39,7 @@ export const ConfigModal: React.FC<ConfigModalProps> = ({
   isRefreshing = false,
   onStopSync,
 }) => {
-  const [activeTab, setActiveTab] = useState<'sources' | 'anonymizer' | 'settings'>('sources');
+  const [activeTab, setActiveTab] = useState<'sources' | 'anonymizer' | 'topics' | 'settings'>('sources');
 
   // Form states for new source
   const [newSourceName, setNewSourceName] = useState('');
@@ -51,6 +55,13 @@ export const ConfigModal: React.FC<ConfigModalProps> = ({
   const [newReplacement, setNewReplacement] = useState('');
   const [ruleAddError, setRuleAddError] = useState('');
   const [ruleAddSuccess, setRuleAddSuccess] = useState('');
+
+  // Form states for new topic preference
+  const [newTopicText, setNewTopicText] = useState('');
+  const [newTopicWeight, setNewTopicWeight] = useState<TopicWeight>('more');
+  const [topicAddError, setTopicAddError] = useState('');
+  const [topicAddSuccess, setTopicAddSuccess] = useState('');
+
   const [saveDefaultSuccess, setSaveDefaultSuccess] = useState(false);
 
   const handleSaveAsDefaultSettings = async () => {
@@ -62,6 +73,7 @@ export const ConfigModal: React.FC<ConfigModalProps> = ({
           settings: {
             sources,
             rules,
+            topicPreferences,
             timeframeValue: '24',
             showImages: true,
           },
@@ -224,6 +236,56 @@ export const ConfigModal: React.FC<ConfigModalProps> = ({
     }
   };
 
+  // Topic Preferences Handlers
+  const handleAddTopic = (e: React.FormEvent) => {
+    e.preventDefault();
+    setTopicAddError('');
+    setTopicAddSuccess('');
+
+    const clean = newTopicText.trim();
+    if (!clean) {
+      setTopicAddError('Please enter a topic or subject name.');
+      return;
+    }
+
+    if (topicPreferences.some((t) => t.topic.toLowerCase() === clean.toLowerCase())) {
+      setTopicAddError(`The topic "${clean}" is already configured.`);
+      return;
+    }
+
+    const newTopic: TopicPreference = {
+      id: `topic-${Date.now()}`,
+      topic: clean,
+      weight: newTopicWeight,
+      enabled: true,
+    };
+
+    onUpdateTopicPreferences([...topicPreferences, newTopic]);
+    setNewTopicText('');
+    setTopicAddSuccess(
+      `Added "${clean}" (${newTopicWeight === 'more' ? 'See More / Following' : 'See Less / Occasional'}).`
+    );
+    setTimeout(() => setTopicAddSuccess(''), 3000);
+  };
+
+  const handleToggleTopic = (id: string) => {
+    onUpdateTopicPreferences(
+      topicPreferences.map((t) => (t.id === id ? { ...t, enabled: !t.enabled } : t))
+    );
+  };
+
+  const handleToggleTopicWeight = (id: string) => {
+    onUpdateTopicPreferences(
+      topicPreferences.map((t) =>
+        t.id === id ? { ...t, weight: t.weight === 'more' ? 'less' : 'more' } : t
+      )
+    );
+  };
+
+  const handleRemoveTopic = (id: string) => {
+    onUpdateTopicPreferences(topicPreferences.filter((t) => t.id !== id));
+  };
+
   // Handle JSON Import
   const handleImportFeeds = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -295,10 +357,10 @@ export const ConfigModal: React.FC<ConfigModalProps> = ({
         </div>
 
         {/* Tab Selector Navigation */}
-        <div className="flex border-b border-slate-800 bg-slate-950/60 px-5 pt-2">
+        <div className="flex border-b border-slate-800 bg-slate-950/60 px-5 pt-2 overflow-x-auto scrollbar-none">
           <button
             onClick={() => setActiveTab('sources')}
-            className={`flex items-center space-x-2 px-4 py-2.5 text-xs font-semibold border-b-2 transition cursor-pointer ${
+            className={`flex items-center space-x-2 px-4 py-2.5 text-xs font-semibold border-b-2 whitespace-nowrap transition cursor-pointer ${
               activeTab === 'sources'
                 ? 'border-indigo-500 text-indigo-300 bg-indigo-950/20'
                 : 'border-transparent text-slate-400 hover:text-slate-200'
@@ -310,7 +372,7 @@ export const ConfigModal: React.FC<ConfigModalProps> = ({
 
           <button
             onClick={() => setActiveTab('anonymizer')}
-            className={`flex items-center space-x-2 px-4 py-2.5 text-xs font-semibold border-b-2 transition cursor-pointer ${
+            className={`flex items-center space-x-2 px-4 py-2.5 text-xs font-semibold border-b-2 whitespace-nowrap transition cursor-pointer ${
               activeTab === 'anonymizer'
                 ? 'border-indigo-500 text-indigo-300 bg-indigo-950/20'
                 : 'border-transparent text-slate-400 hover:text-slate-200'
@@ -321,8 +383,20 @@ export const ConfigModal: React.FC<ConfigModalProps> = ({
           </button>
 
           <button
+            onClick={() => setActiveTab('topics')}
+            className={`flex items-center space-x-2 px-4 py-2.5 text-xs font-semibold border-b-2 whitespace-nowrap transition cursor-pointer ${
+              activeTab === 'topics'
+                ? 'border-indigo-500 text-indigo-300 bg-indigo-950/20'
+                : 'border-transparent text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            <Compass className="w-4 h-4" />
+            <span>Topics ({topicPreferences.filter((t) => t.enabled).length})</span>
+          </button>
+
+          <button
             onClick={() => setActiveTab('settings')}
-            className={`flex items-center space-x-2 px-4 py-2.5 text-xs font-semibold border-b-2 transition cursor-pointer ${
+            className={`flex items-center space-x-2 px-4 py-2.5 text-xs font-semibold border-b-2 whitespace-nowrap transition cursor-pointer ${
               activeTab === 'settings'
                 ? 'border-indigo-500 text-indigo-300 bg-indigo-950/20'
                 : 'border-transparent text-slate-400 hover:text-slate-200'
@@ -622,7 +696,183 @@ export const ConfigModal: React.FC<ConfigModalProps> = ({
             </div>
           )}
 
-          {/* TAB 3: PREFERENCES */}
+          {/* TAB 3: TOPICS WEIGHTING (Option A - No Quick-Add Chips) */}
+          {activeTab === 'topics' && (
+            <div className="space-y-5">
+              {/* Header Overview Card */}
+              <div>
+                <h3 className="text-xs font-bold uppercase tracking-wider text-slate-400 mb-1 flex items-center">
+                  <Compass className="w-4 h-4 mr-1.5 text-indigo-400" />
+                  Topic Weighting & Executive Curation
+                </h3>
+                <p className="text-xs text-slate-400 mb-3">
+                  Configure topics you want to see more or less of during news synthesis. Rather than a hard filter, these act as editorial weights to dial coverage up or down while keeping all other news balanced.
+                </p>
+
+                {/* Legend Cards */}
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 mb-3">
+                  <div className="bg-emerald-950/40 border border-emerald-850/60 p-2.5 rounded-xl flex items-start space-x-2.5">
+                    <TrendingUp className="w-4 h-4 text-emerald-400 mt-0.5 shrink-0" />
+                    <div>
+                      <span className="text-xs font-semibold text-emerald-300">See More (Following)</span>
+                      <p className="text-[11px] text-slate-400 mt-0.5 leading-relaxed">
+                        Actively prioritizes stories on this subject and tags synthesized articles with <strong className="text-emerald-300 font-medium">Following</strong>.
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="bg-rose-950/40 border border-rose-850/60 p-2.5 rounded-xl flex items-start space-x-2.5">
+                    <SlidersHorizontal className="w-4 h-4 text-rose-400 mt-0.5 shrink-0" />
+                    <div>
+                      <span className="text-xs font-semibold text-rose-300">See Less (Occasional)</span>
+                      <p className="text-[11px] text-slate-400 mt-0.5 leading-relaxed">
+                        Downweights routine coverage, selecting only landmark breaking events, and tags articles with <strong className="text-rose-300 font-medium">Occasional</strong>.
+                      </p>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Configured Topics List */}
+                <div className="space-y-2 max-h-60 overflow-y-auto pr-1">
+                  {topicPreferences.length === 0 ? (
+                    <div className="bg-slate-950/40 border border-slate-800 rounded-xl p-4 text-center">
+                      <p className="text-xs text-slate-400">
+                        No topic weights configured yet. All news will be synthesized with standard balanced coverage.
+                      </p>
+                      <p className="text-[11px] text-slate-500 mt-1">
+                        Use the form below to add a topic like <span className="text-slate-400">"UK politics"</span>, <span className="text-slate-400">"European soccer"</span>, or <span className="text-slate-400">"Quebec and Montreal"</span>.
+                      </p>
+                    </div>
+                  ) : (
+                    topicPreferences.map((topic) => (
+                      <div
+                        key={topic.id}
+                        className={`flex items-center justify-between px-3.5 py-2.5 rounded-xl text-xs border transition ${
+                          topic.enabled
+                            ? 'bg-slate-800/80 border-slate-750'
+                            : 'bg-slate-900/50 border-slate-850 opacity-60'
+                        }`}
+                      >
+                        <div className="flex items-center space-x-3 min-w-0 flex-1 mr-2">
+                          <input
+                            type="checkbox"
+                            checked={topic.enabled}
+                            onChange={() => handleToggleTopic(topic.id)}
+                            className="w-4 h-4 text-indigo-600 bg-slate-900 border-slate-700 rounded focus:ring-indigo-500 cursor-pointer"
+                            title={topic.enabled ? 'Pause topic weight' : 'Enable topic weight'}
+                          />
+
+                          <div className="min-w-0 flex-1 flex flex-wrap items-center gap-2">
+                            <span className="font-semibold text-slate-100 truncate text-xs">
+                              {topic.topic}
+                            </span>
+
+                            {topic.weight === 'more' ? (
+                              <span className="inline-flex items-center space-x-1 px-2 py-0.5 rounded-md text-[10px] font-semibold bg-emerald-950/90 text-emerald-300 border border-emerald-700/80">
+                                <TrendingUp className="w-2.5 h-2.5 text-emerald-400" />
+                                <span>See More &bull; Following</span>
+                              </span>
+                            ) : (
+                              <span className="inline-flex items-center space-x-1 px-2 py-0.5 rounded-md text-[10px] font-semibold bg-rose-950/90 text-rose-300 border border-rose-700/80">
+                                <SlidersHorizontal className="w-2.5 h-2.5 text-rose-400" />
+                                <span>See Less &bull; Occasional</span>
+                              </span>
+                            )}
+                          </div>
+                        </div>
+
+                        <div className="flex items-center space-x-2">
+                          <button
+                            onClick={() => handleToggleTopicWeight(topic.id)}
+                            className="px-2 py-1 bg-slate-900 hover:bg-slate-800 text-slate-300 text-[11px] rounded-lg border border-slate-700 hover:border-slate-600 transition cursor-pointer whitespace-nowrap"
+                            title="Flip weight between See More and See Less"
+                          >
+                            Switch to {topic.weight === 'more' ? 'See Less' : 'See More'}
+                          </button>
+
+                          <button
+                            onClick={() => handleRemoveTopic(topic.id)}
+                            className="text-slate-400 hover:text-red-400 p-1 rounded-lg transition cursor-pointer"
+                            title="Delete topic"
+                          >
+                            <Trash2 className="w-4 h-4" />
+                          </button>
+                        </div>
+                      </div>
+                    ))
+                  )}
+                </div>
+              </div>
+
+              {/* Add New Topic Form (Option A: Explicit More / Less Toggle Buttons, No Quick-Add Chips) */}
+              <form onSubmit={handleAddTopic} className="bg-slate-950/60 border border-slate-800 p-4 rounded-2xl space-y-3">
+                <h4 className="text-xs font-bold text-slate-300">Add Topic Weight</h4>
+
+                {topicAddError && (
+                  <p className="text-xs text-red-400 font-medium">{topicAddError}</p>
+                )}
+                {topicAddSuccess && (
+                  <p className="text-xs text-emerald-400 font-medium flex items-center gap-1">
+                    <CheckCircle2 className="w-3.5 h-3.5" />
+                    <span>{topicAddSuccess}</span>
+                  </p>
+                )}
+
+                <div>
+                  <input
+                    type="text"
+                    placeholder="Topic or subject (e.g. UK politics, European soccer, Quebec and Montreal)..."
+                    value={newTopicText}
+                    onChange={(e) => setNewTopicText(e.target.value)}
+                    className="w-full bg-slate-900 border border-slate-750 rounded-xl px-3 py-2 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-indigo-500"
+                  />
+                </div>
+
+                <div className="space-y-1.5">
+                  <span className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider">
+                    Editorial Weight:
+                  </span>
+                  <div className="grid grid-cols-2 gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setNewTopicWeight('more')}
+                      className={`flex items-center justify-center space-x-2 py-2 px-3 rounded-xl text-xs font-semibold transition cursor-pointer border ${
+                        newTopicWeight === 'more'
+                          ? 'bg-emerald-600/90 hover:bg-emerald-600 text-white border-emerald-500 shadow-sm'
+                          : 'bg-slate-900 text-slate-400 border-slate-750 hover:text-slate-200 hover:bg-slate-850'
+                      }`}
+                    >
+                      <TrendingUp className="w-3.5 h-3.5" />
+                      <span>See More (Following)</span>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => setNewTopicWeight('less')}
+                      className={`flex items-center justify-center space-x-2 py-2 px-3 rounded-xl text-xs font-semibold transition cursor-pointer border ${
+                        newTopicWeight === 'less'
+                          ? 'bg-rose-600/90 hover:bg-rose-600 text-white border-rose-500 shadow-sm'
+                          : 'bg-slate-900 text-slate-400 border-slate-750 hover:text-slate-200 hover:bg-slate-850'
+                      }`}
+                    >
+                      <SlidersHorizontal className="w-3.5 h-3.5" />
+                      <span>See Less (Occasional)</span>
+                    </button>
+                  </div>
+                </div>
+
+                <button
+                  type="submit"
+                  className="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-medium py-2 rounded-xl text-xs transition flex items-center justify-center space-x-1 cursor-pointer"
+                >
+                  <Plus className="w-4 h-4" />
+                  <span>Add Topic Weight</span>
+                </button>
+              </form>
+            </div>
+          )}
+
+          {/* TAB 4: PREFERENCES */}
           {activeTab === 'settings' && (
             <div className="space-y-5 text-xs text-slate-300">
               
@@ -755,7 +1005,9 @@ export const ConfigModal: React.FC<ConfigModalProps> = ({
         {/* Modal Footer */}
         <div className="px-5 py-3.5 border-t border-slate-800 bg-slate-950 flex items-center justify-between">
           <p className="text-[11px] text-slate-500">
-            Changes are saved automatically to browser storage.
+            {user
+              ? `Changes are saved automatically to your Google account (${user.email}).`
+              : 'Changes are saved automatically to browser storage.'}
           </p>
           {isRefreshing ? (
             <button

@@ -4,8 +4,9 @@ import { CategoryTabs } from './components/CategoryTabs';
 import { ArticleCard } from './components/ArticleCard';
 import { ArticleSkeleton } from './components/ArticleSkeleton';
 import { ConfigModal } from './components/ConfigModal';
-import { NewsSource, ReplacementRule, SynthesizedArticle, RawNewsItem, UserProfile } from './types';
+import { NewsSource, ReplacementRule, SynthesizedArticle, RawNewsItem, UserProfile, TopicPreference } from './types';
 import { synthesizeLocalFallback, hasSufficientArticleDetails, cleanMediaAudioVideoJunk, stripHtml } from './utils/rss';
+import { DEFAULT_SOURCES, DEFAULT_RULES, DEFAULT_TOPIC_PREFERENCES } from './utils/defaultSettings';
 import { AlertCircle, RefreshCw, Sliders, ChevronDown, Square, Newspaper, Anchor } from 'lucide-react';
 
 interface SyncProgress {
@@ -58,20 +59,47 @@ export default function App() {
   const [sources, setSources] = useState<NewsSource[]>(() => {
     try {
       const saved = localStorage.getItem('an_sources_v5') || localStorage.getItem('an_sources_v2');
-      return saved ? JSON.parse(saved) : [];
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+      }
+      return DEFAULT_SOURCES;
     } catch {
-      return [];
+      return DEFAULT_SOURCES;
     }
   });
 
   const [rules, setRules] = useState<ReplacementRule[]>(() => {
     try {
       const saved = localStorage.getItem('an_rules_v2') || localStorage.getItem('an_rules_v1') || localStorage.getItem('an_rules');
-      return saved ? JSON.parse(saved) : [];
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+      }
+      return DEFAULT_RULES;
     } catch {
-      return [];
+      return DEFAULT_RULES;
     }
   });
+
+  const [topicPreferences, setTopicPreferences] = useState<TopicPreference[]>(() => {
+    try {
+      const saved = localStorage.getItem('an_topics_v1');
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed)) return parsed;
+      }
+      return DEFAULT_TOPIC_PREFERENCES;
+    } catch {
+      return DEFAULT_TOPIC_PREFERENCES;
+    }
+  });
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('an_topics_v1', JSON.stringify(topicPreferences));
+    } catch {}
+  }, [topicPreferences]);
 
   const [timeframeValue, setTimeframeValue] = useState<string>(() => {
     return localStorage.getItem('an_timeframe_v2') || '24';
@@ -246,11 +274,14 @@ export default function App() {
       if (res.ok) {
         const data = await res.json();
         if (data.settings) {
-          if (Array.isArray(data.settings.sources)) {
+          if (Array.isArray(data.settings.sources) && data.settings.sources.length > 0) {
             setSources(data.settings.sources);
           }
           if (Array.isArray(data.settings.rules)) {
             setRules(data.settings.rules);
+          }
+          if (Array.isArray(data.settings.topicPreferences)) {
+            setTopicPreferences(data.settings.topicPreferences);
           }
           if (data.settings.timeframeValue) {
             setTimeframeValue(data.settings.timeframeValue);
@@ -285,15 +316,31 @@ export default function App() {
       }
     } else {
       loadedUserEmailRef.current = null;
-      setIsSettingsLoadedFromServer(true);
+      fetch('/api/user/settings')
+        .then((res) => (res.ok ? res.json() : null))
+        .then((data) => {
+          if (data && data.settings) {
+            if (Array.isArray(data.settings.sources) && data.settings.sources.length > 0) {
+              setSources((prev) => (prev.length === 0 ? data.settings.sources : prev));
+            }
+            if (Array.isArray(data.settings.topicPreferences) && data.settings.topicPreferences.length > 0) {
+              setTopicPreferences((prev) => (prev.length === 0 ? data.settings.topicPreferences : prev));
+            }
+          }
+        })
+        .catch(() => {})
+        .finally(() => {
+          setIsSettingsLoadedFromServer(true);
+        });
     }
   }, [user, loadUserSettings]);
 
-  // Save user settings to server whenever sources, rules, timeframe, showImages, or selectedModel change
+  // Save user settings to server whenever sources, rules, topicPreferences, timeframe, showImages, or selectedModel change
   const saveUserSettings = useCallback(
     async (
       currentSources: NewsSource[],
       currentRules: ReplacementRule[],
+      currentTopics: TopicPreference[],
       currentTf: string,
       currentImg: boolean,
       currentModel: string,
@@ -309,6 +356,7 @@ export default function App() {
             settings: {
               sources: currentSources,
               rules: currentRules,
+              topicPreferences: currentTopics,
               timeframeValue: currentTf,
               showImages: currentImg,
               selectedModel: currentModel,
@@ -328,10 +376,10 @@ export default function App() {
   useEffect(() => {
     if (!isSettingsLoadedFromServer || !user) return;
     const timer = setTimeout(() => {
-      saveUserSettings(sources, rules, timeframeValue, showImages, selectedModel, primarySourceId);
+      saveUserSettings(sources, rules, topicPreferences, timeframeValue, showImages, selectedModel, primarySourceId);
     }, 400);
     return () => clearTimeout(timer);
-  }, [sources, rules, timeframeValue, showImages, selectedModel, primarySourceId, saveUserSettings, isSettingsLoadedFromServer, user]);
+  }, [sources, rules, topicPreferences, timeframeValue, showImages, selectedModel, primarySourceId, saveUserSettings, isSettingsLoadedFromServer, user]);
 
   const handleLogin = useCallback(async () => {
     if (!hasOauth) {
@@ -570,6 +618,7 @@ export default function App() {
         body: JSON.stringify({
           items: rawItems,
           rules,
+          topics: topicPreferences,
           timeframeHours,
           selectedModel,
           primarySourceName: primarySourceId !== 'none' ? primarySourceName : undefined,
@@ -587,7 +636,7 @@ export default function App() {
       // Clean summaries and details to remove audio/video player text
       const processedArticles = (rawSynth.length > 0
         ? rawSynth
-        : synthesizeLocalFallback(rawItems, rules, timeframeHours, primarySourceId !== 'none' ? primarySourceName : undefined)
+        : synthesizeLocalFallback(rawItems, rules, timeframeHours, primarySourceId !== 'none' ? primarySourceName : undefined, topicPreferences)
       ).map((art) => {
         const cleanSummary = cleanMediaAudioVideoJunk(stripHtml(art.summary || ''));
         const cleanDetails = art.fullDetails ? cleanMediaAudioVideoJunk(art.fullDetails) : undefined;
@@ -598,8 +647,13 @@ export default function App() {
         };
       });
 
-      // Rank Option A: Primary Tier (rich multi-source breakdowns) first, followed by Secondary Tier (single-source / concise)
+      // Rank stories: Boosted "Following" topics come first, then neutral stories, then "Occasional" stories
+      // Within each tier, prioritize rich multi-source breakdowns first
       processedArticles.sort((a, b) => {
+        const aTopicScore = a.topicTag === 'Following' ? 2 : a.topicTag === 'Occasional' ? 0 : 1;
+        const bTopicScore = b.topicTag === 'Following' ? 2 : b.topicTag === 'Occasional' ? 0 : 1;
+        if (aTopicScore !== bTopicScore) return bTopicScore - aTopicScore;
+
         const aRich = hasSufficientArticleDetails(a.fullDetails, a.title, a.summary) ? 1 : 0;
         const bRich = hasSufficientArticleDetails(b.fullDetails, b.title, b.summary) ? 1 : 0;
         if (aRich !== bRich) return bRich - aRich;
@@ -646,7 +700,7 @@ export default function App() {
         abortControllerRef.current = null;
       }
     }
-  }, [sources, rules, timeframeValue, activeTab, selectedModel, getEffectiveTimeframeHours, primarySourceId]);
+  }, [sources, rules, topicPreferences, timeframeValue, activeTab, selectedModel, getEffectiveTimeframeHours, primarySourceId]);
 
   // Handle Tab Switch with immediate loading feedback
   const handleSelectTab = useCallback((newTab: string) => {
@@ -680,9 +734,34 @@ export default function App() {
 
   const handleResetDefaults = async () => {
     try {
-      await fetch('/api/user/settings', { method: 'DELETE', headers: getAuthHeaders(user) });
-      loadedUserEmailRef.current = null;
-      await loadUserSettings(true);
+      setSources(DEFAULT_SOURCES);
+      setRules(DEFAULT_RULES);
+      setTopicPreferences(DEFAULT_TOPIC_PREFERENCES);
+      setTimeframeValue('24');
+      setShowImages(true);
+      setSelectedModel('gemini-3.5-lite');
+      setPrimarySourceId('none');
+      localStorage.removeItem('an_sources_v5');
+      localStorage.removeItem('an_rules_v2');
+      localStorage.removeItem('an_topics_v1');
+
+      if (user && user.email) {
+        await fetch('/api/user/settings', {
+          method: 'POST',
+          headers: getAuthHeaders(user),
+          body: JSON.stringify({
+            settings: {
+              sources: DEFAULT_SOURCES,
+              rules: DEFAULT_RULES,
+              topicPreferences: DEFAULT_TOPIC_PREFERENCES,
+              timeframeValue: '24',
+              showImages: true,
+              selectedModel: 'gemini-3.5-lite',
+              primarySourceId: 'none',
+            },
+          }),
+        });
+      }
     } catch (err) {
       console.error('Failed to reset settings', err);
     }
@@ -858,9 +937,15 @@ export default function App() {
             <h2 className="text-sm font-bold uppercase tracking-wider text-slate-300">
               {activeTab === 'All' ? 'Top Headline Syntheses' : `${activeTab} Syntheses`}
             </h2>
-            <span className="bg-indigo-950 text-indigo-300 border border-indigo-800/60 text-xs font-mono px-2.5 py-0.5 rounded-full font-bold">
-              Showing {visibleArticles.length} of {articles.length}
-            </span>
+            {isRefreshing ? (
+              <span className="bg-indigo-950 text-indigo-400 border border-indigo-900/50 text-xs font-mono px-2.5 py-0.5 rounded-full font-bold animate-pulse">
+                Processing...
+              </span>
+            ) : (
+              <span className="bg-indigo-950 text-indigo-300 border border-indigo-800/60 text-xs font-mono px-2.5 py-0.5 rounded-full font-bold">
+                Showing {visibleArticles.length} of {articles.length}
+              </span>
+            )}
           </div>
 
           <div className="text-xs text-slate-500 font-medium">
@@ -1001,6 +1086,8 @@ export default function App() {
         onUpdateSources={setSources}
         rules={rules}
         onUpdateRules={setRules}
+        topicPreferences={topicPreferences}
+        onUpdateTopicPreferences={setTopicPreferences}
         onResetDefaults={handleResetDefaults}
         onClearCache={handleClearCache}
         onTriggerResynthesize={fetchAndSynthesize}
