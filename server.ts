@@ -545,47 +545,74 @@ Respond ONLY with valid JSON:
     return result;
   }
 
+  // Global Request Logger for API and Auth routes
+  app.use((req, res, next) => {
+    if (req.path.startsWith('/api') || req.path.startsWith('/auth')) {
+      console.log(`[HTTP ${req.method}] ${req.path} | Host: ${req.get('host') || 'none'} | X-Forwarded-Host: ${req.get('x-forwarded-host') || 'none'} | Query: ${JSON.stringify(req.query)}`);
+    }
+    next();
+  });
+
   // 1. Health Check
   app.get('/api/health', (req, res) => {
     const hasKey = Boolean(process.env.GEMINI_API_KEY);
-    res.json({ status: 'ok', aiEnabled: hasKey, hasOauth: Boolean(process.env.OAUTH_CLIENT_ID) });
+    const hasOauth = Boolean(process.env.OAUTH_CLIENT_ID);
+    console.log(`[Health Check] aiEnabled: ${hasKey}, hasOauth: ${hasOauth}`);
+    res.json({ status: 'ok', aiEnabled: hasKey, hasOauth });
   });
 
   // Helper to determine the accurate public redirect URI for Google OAuth
   function getRedirectUri(req: express.Request): string {
+    // 1. Explicit APP_URL configured by user
     if (process.env.APP_URL) {
       const baseUrl = process.env.APP_URL.replace(/\/$/, '');
-      return `${baseUrl}/auth/google/callback`;
+      const uri = `${baseUrl}/auth/google/callback`;
+      console.log(`[OAuth Diagnostic] Redirect URI from APP_URL: ${uri}`);
+      return uri;
     }
 
-    const referer = req.get('referer') || req.get('origin');
-    if (referer) {
-      try {
-        const url = new URL(referer);
-        if (url.hostname && !url.hostname.includes('localhost') && url.hostname !== '127.0.0.1') {
-          return `${url.protocol}//${url.host}/auth/google/callback`;
-        }
-      } catch (e) {
-        // ignore
-      }
-    }
-
+    // 2. Host header from x-forwarded-host (e.g. abstract-news.vercel.app on Vercel)
     const xForwardedHost = req.get('x-forwarded-host');
     const xForwardedProto = req.get('x-forwarded-proto') || 'https';
     if (xForwardedHost && !xForwardedHost.includes('localhost') && xForwardedHost !== '127.0.0.1') {
-      return `${xForwardedProto}://${xForwardedHost}/auth/google/callback`;
+      const uri = `${xForwardedProto}://${xForwardedHost}/auth/google/callback`;
+      console.log(`[OAuth Diagnostic] Redirect URI from x-forwarded-host (${xForwardedHost}): ${uri}`);
+      return uri;
     }
 
+    // 3. Vercel System Env VERCEL_URL
+    if (process.env.VERCEL_URL) {
+      const cleanVercelUrl = process.env.VERCEL_URL.replace(/^https?:\/\//, '').replace(/\/$/, '');
+      const uri = `https://${cleanVercelUrl}/auth/google/callback`;
+      console.log(`[OAuth Diagnostic] Redirect URI from VERCEL_URL: ${uri}`);
+      return uri;
+    }
+
+    // 4. Host header fallback
     const host = req.get('host') || 'localhost:3000';
     const protocol = req.get('x-forwarded-proto') || req.protocol || 'http';
-    return `${protocol}://${host}/auth/google/callback`;
+    const uri = `${protocol}://${host}/auth/google/callback`;
+    console.log(`[OAuth Diagnostic] Redirect URI from host header (${host}): ${uri}`);
+    return uri;
   }
 
   // 1a. Get Google OAuth URL for direct popup launch
   app.get('/api/auth/url', (req, res) => {
+    console.log('[OAuth Step 1] Request received at /api/auth/url');
     const clientId = process.env.OAUTH_CLIENT_ID;
+    const clientSecret = process.env.OAUTH_CLIENT_SECRET;
+
     if (!clientId) {
-      return res.status(400).json({ error: 'OAuth Client ID not configured' });
+      console.error('[OAuth Error] OAUTH_CLIENT_ID environment variable is MISSING on server!');
+      return res.status(400).json({
+        error: 'OAuth Client ID not configured',
+        hasClientId: false,
+        hasClientSecret: Boolean(clientSecret),
+      });
+    }
+
+    if (!clientSecret) {
+      console.warn('[OAuth Warning] OAUTH_CLIENT_SECRET environment variable is MISSING on server!');
     }
 
     const redirectUri = getRedirectUri(req);
@@ -604,20 +631,23 @@ Respond ONLY with valid JSON:
 
     const authUrl = `https://accounts.google.com/o/oauth2/v2/auth?client_id=${encodeURIComponent(clientId)}&redirect_uri=${encodeURIComponent(redirectUri)}&response_type=code&scope=${encodeURIComponent(scopes)}&state=${encodeURIComponent(state)}&prompt=select_account&access_type=offline`;
 
-    res.json({ url: authUrl });
+    console.log(`[OAuth Step 1 Success] Generated Auth URL with redirectUri=${redirectUri}`);
+    res.json({ url: authUrl, redirectUri });
   });
 
   // 1b. Google OAuth Initiate
   app.get('/auth/google', (req, res) => {
+    console.log('[OAuth Step 1] Request received at /auth/google');
     const clientId = process.env.OAUTH_CLIENT_ID;
     if (!clientId) {
+      console.error('[OAuth Error] /auth/google invoked but OAUTH_CLIENT_ID is MISSING!');
       if (req.query.popup === 'true') {
         return res.send(`
           <html>
             <body style="font-family: sans-serif; background: #0f172a; color: #f8fafc; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0;">
               <div style="text-align: center; padding: 24px; background: #1e293b; border-radius: 12px; max-width: 400px; border: 1px solid #334155;">
                 <h3 style="margin-top:0;">OAuth Client ID Not Configured</h3>
-                <p style="font-size: 14px; color: #94a3b8;">Please enter your <code>OAUTH_CLIENT_ID</code> and <code>OAUTH_CLIENT_SECRET</code> in the environment panel on the left.</p>
+                <p style="font-size: 14px; color: #94a3b8;">Please enter your <code>OAUTH_CLIENT_ID</code> and <code>OAUTH_CLIENT_SECRET</code> in your Vercel Environment Variables.</p>
                 <button onclick="window.close()" style="background: #3b82f6; color: white; border: none; padding: 8px 16px; border-radius: 6px; cursor: pointer;">Close Window</button>
               </div>
             </body>
@@ -643,30 +673,45 @@ Respond ONLY with valid JSON:
 
     const authUrl = `https://accounts.google.com/o/oauth2/v2/auth?client_id=${encodeURIComponent(clientId)}&redirect_uri=${encodeURIComponent(redirectUri)}&response_type=code&scope=${encodeURIComponent(scopes)}&state=${encodeURIComponent(state)}&prompt=select_account&access_type=offline`;
 
+    console.log(`[OAuth Step 1 Redirecting] Redirecting user to Google accounts page with redirectUri=${redirectUri}`);
     res.redirect(authUrl);
   });
 
   // 1c. Google OAuth Callback
   app.get('/auth/google/callback', async (req, res) => {
-    const { code, state } = req.query;
+    console.log('[OAuth Callback] Received callback request from Google');
+    const { code, state, error: googleError } = req.query;
+
+    if (googleError) {
+      console.error(`[OAuth Callback Error from Google] Google returned error parameter: ${googleError}`);
+      return res.status(400).send(`Google authentication error: ${googleError}`);
+    }
 
     if (!code || typeof code !== 'string') {
-      return res.status(400).send('Missing authorization code.');
+      console.error('[OAuth Callback Error] Missing authorization code parameter');
+      return res.status(400).send('Missing authorization code parameter.');
     }
 
     const clientId = process.env.OAUTH_CLIENT_ID;
     const clientSecret = process.env.OAUTH_CLIENT_SECRET;
     const redirectUri = req.session.oauthRedirectUri || getRedirectUri(req);
 
+    console.log(`[OAuth Callback Config Check] Client ID set: ${Boolean(clientId)}, Client Secret set: ${Boolean(clientSecret)}, Redirect URI: ${redirectUri}`);
+
+    if (!clientId || !clientSecret) {
+      console.error('[OAuth Callback Fatal Error] OAUTH_CLIENT_ID or OAUTH_CLIENT_SECRET is missing on the server!');
+      return res.status(500).send('Server configuration error: OAUTH_CLIENT_ID or OAUTH_CLIENT_SECRET is missing.');
+    }
+
     try {
-      // Exchange authorization code for tokens
+      console.log('[OAuth Callback Step 2] Requesting token exchange from Google (https://oauth2.googleapis.com/token)...');
       const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
         method: 'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
         body: new URLSearchParams({
           code,
-          client_id: clientId || '',
-          client_secret: clientSecret || '',
+          client_id: clientId,
+          client_secret: clientSecret,
           redirect_uri: redirectUri,
           grant_type: 'authorization_code',
         }),
@@ -674,23 +719,27 @@ Respond ONLY with valid JSON:
 
       if (!tokenRes.ok) {
         const errBody = await tokenRes.text();
-        console.error('Failed token exchange:', errBody);
-        return res.status(500).send('Failed token exchange with Google.');
+        console.error(`[OAuth Callback Error] Token exchange failed with HTTP ${tokenRes.status}: ${errBody}`);
+        return res.status(500).send(`Failed token exchange with Google: ${errBody}`);
       }
 
       const tokens = await tokenRes.json();
       const accessToken = tokens.access_token;
+      console.log('[OAuth Callback Step 2 Success] Successfully exchanged code for Google access token');
 
-      // Fetch user profile from Google UserInfo endpoint
+      console.log('[OAuth Callback Step 3] Fetching user profile from Google userinfo endpoint...');
       const profileRes = await fetch('https://www.googleapis.com/oauth2/v2/userinfo', {
         headers: { Authorization: `Bearer ${accessToken}` },
       });
 
       if (!profileRes.ok) {
+        const profileErr = await profileRes.text();
+        console.error(`[OAuth Callback Error] Profile fetch failed with HTTP ${profileRes.status}: ${profileErr}`);
         return res.status(500).send('Failed to fetch user profile.');
       }
 
       const profile = await profileRes.json();
+      console.log(`[OAuth Callback Step 3 Success] User profile retrieved: email=${profile.email}, name=${profile.name}`);
 
       const rawEmail = (profile.email || '').toLowerCase().trim();
       const tokenPayload = {
@@ -711,14 +760,13 @@ Respond ONLY with valid JSON:
       };
 
       req.session.user = user;
-      
-      // Determine if this was a popup flow (check session OR state parameter)
-      const isPopup = req.session.isPopup || (typeof state === 'string' && state.startsWith('popup_'));
 
-      // Ensure session cookie is saved before completing HTTP response
+      const isPopup = req.session.isPopup || (typeof state === 'string' && state.startsWith('popup_'));
+      console.log(`[OAuth Callback Complete] Session populated for user=${user.email} (isPopup=${isPopup})`);
+
       req.session.save((err) => {
         if (err) {
-          console.error('Error saving session in callback:', err);
+          console.error('[OAuth Callback Session Save Error]', err);
         }
 
         if (isPopup) {
@@ -752,8 +800,8 @@ Respond ONLY with valid JSON:
         res.redirect('/');
       });
     } catch (err: any) {
-      console.error('Error during Google callback:', err);
-      res.status(500).send('Authentication error occurred.');
+      console.error('[OAuth Callback Exception] Exception during callback processing:', err);
+      res.status(500).send(`Authentication error occurred: ${err.message || err}`);
     }
   });
 
