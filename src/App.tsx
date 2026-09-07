@@ -113,7 +113,7 @@ export default function App() {
       if (saved) {
         const parsed = JSON.parse(saved);
         return Array.isArray(parsed)
-          ? parsed.filter((art: SynthesizedArticle) => hasSufficientArticleDetails(art.fullDetails, art.title, art.summary))
+          ? parsed.filter((art: SynthesizedArticle) => Boolean(art && art.title && art.title.trim().length > 0))
           : [];
       }
       return [];

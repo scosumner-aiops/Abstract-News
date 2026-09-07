@@ -19,13 +19,14 @@ export function isGoogleNewsPlaceholder(url: string): boolean {
 }
 
 /**
- * Extracts image URLs from article HTML content (JSON-LD structured data, OpenGraph, Twitter card, srcset, or <img> tags)
+ * Extracts image URLs from article HTML content (JSON-LD structured data, OpenGraph, Twitter card, srcset, or <img> tags),
+ * filtering out any images whose URL or associated captions/alt-text match active citation anonymizer rules.
  */
-export function extractImagesFromArticleHtml(html: string, pageUrl: string): string[] {
+export function extractImagesFromArticleHtml(html: string, pageUrl: string, rules?: ReplacementRule[]): string[] {
   if (!html) return [];
   const images: string[] = [];
 
-  const addImage = (rawUrl: string) => {
+  const addImage = (rawUrl: string, metaText: string = '') => {
     if (!rawUrl) return;
     try {
       let cleanUrl = rawUrl.replace(/&amp;/g, '&').trim();
@@ -39,6 +40,13 @@ export function extractImagesFromArticleHtml(html: string, pageUrl: string): str
       // Upgrade Google content thumbnail URLs to high-resolution (1200px)
       if (resolved.includes('googleusercontent.com')) {
         resolved = resolved.replace(/=s0-w\d+.*|=w\d+.*/, '=s0-w1200');
+      }
+
+      // Filter against active rules if provided
+      if (rules && rules.length > 0) {
+        if (isImageMatchingRules(resolved, rules, metaText)) {
+          return;
+        }
       }
 
       if ((resolved.startsWith('http://') || resolved.startsWith('https://')) && !images.includes(resolved)) {
@@ -59,20 +67,25 @@ export function extractImagesFromArticleHtml(html: string, pageUrl: string): str
       const items = Array.isArray(parsed) ? parsed : [parsed];
       for (const obj of items) {
         if (!obj || typeof obj !== 'object') continue;
+        const metaText = [obj.caption, obj.description, obj.name, obj.headline].filter(Boolean).join(' ');
         if (typeof obj.image === 'string') {
-          addImage(obj.image);
+          addImage(obj.image, metaText);
         } else if (Array.isArray(obj.image)) {
           obj.image.forEach((imgItem: any) => {
-            if (typeof imgItem === 'string') addImage(imgItem);
-            else if (imgItem && typeof imgItem.url === 'string') addImage(imgItem.url);
+            if (typeof imgItem === 'string') addImage(imgItem, metaText);
+            else if (imgItem && typeof imgItem.url === 'string') {
+              const itemMeta = [imgItem.caption, imgItem.description, imgItem.name, metaText].filter(Boolean).join(' ');
+              addImage(imgItem.url, itemMeta);
+            }
           });
         } else if (obj.image && typeof obj.image.url === 'string') {
-          addImage(obj.image.url);
+          const itemMeta = [obj.image.caption, obj.image.description, obj.image.name, metaText].filter(Boolean).join(' ');
+          addImage(obj.image.url, itemMeta);
         }
         if (typeof obj.thumbnailUrl === 'string') {
-          addImage(obj.thumbnailUrl);
+          addImage(obj.thumbnailUrl, metaText);
         } else if (Array.isArray(obj.thumbnailUrl)) {
-          obj.thumbnailUrl.forEach((t: any) => { if (typeof t === 'string') addImage(t); });
+          obj.thumbnailUrl.forEach((t: any) => { if (typeof t === 'string') addImage(t, metaText); });
         }
       }
     } catch {
@@ -80,21 +93,25 @@ export function extractImagesFromArticleHtml(html: string, pageUrl: string): str
     }
   }
 
+  // Extract page-level OpenGraph / Twitter image alt texts
+  const ogAltMatch = html.match(/<meta[^>]+(?:property|name)=["'](?:og:image:alt|twitter:image:alt)["'][^>]+content=["']([^"']+)["']/i);
+  const ogAltText = ogAltMatch ? ogAltMatch[1] : '';
+
   // 1. Meta OpenGraph, Twitter, Itemprop, Sailthru, Parsely tags
   const metaMatches = html.matchAll(/<meta[^>]+(?:property|name|itemprop)=["'](?:og:image(?::url|:secure_url)?|twitter:image(?::src)?|image|sailthru\.image\.full|parsely-image)["'][^>]+content=["']([^"']+)["']/gi);
   for (const match of metaMatches) {
-    addImage(match[1]);
+    addImage(match[1], ogAltText);
   }
 
   const metaMatchesRev = html.matchAll(/<meta[^>]+content=["']([^"']+)["'][^>]+(?:property|name|itemprop)=["'](?:og:image(?::url|:secure_url)?|twitter:image(?::src)?|image|sailthru\.image\.full|parsely-image)["']/gi);
   for (const match of metaMatchesRev) {
-    addImage(match[1]);
+    addImage(match[1], ogAltText);
   }
 
   // 2. Link rel="image_src"
   const linkMatches = html.matchAll(/<link[^>]+rel=["']image_src["'][^>]+href=["']([^"']+)["']/gi);
   for (const match of linkMatches) {
-    addImage(match[1]);
+    addImage(match[1], ogAltText);
   }
 
   // 3. Primary article container image tags & responsive srcsets
@@ -104,9 +121,32 @@ export function extractImagesFromArticleHtml(html: string, pageUrl: string): str
     html.match(/<div[^>]*class=["'][^"']*(?:article|story|post|entry|content|body)[^"']*["'][^>]*>([\s\S]*?)<\/div>/i);
   const container = articleMatch ? articleMatch[1] : html;
 
+  // Extract <figure> elements with their <figcaption>
+  const figureMatches = container.matchAll(/<figure[^>]*>([\s\S]*?)<\/figure>/gi);
+  for (const figMatch of figureMatches) {
+    const figContent = figMatch[1];
+    const capMatch = figContent.match(/<figcaption[^>]*>([\s\S]*?)<\/figcaption>/i);
+    const figCaption = capMatch ? capMatch[1].replace(/<[^>]+>/g, ' ').trim() : '';
+
+    const figImgs = figContent.matchAll(/<img[^>]+(?:src|data-src)=["']([^"']+)["'][^>]*>/gi);
+    for (const imgM of figImgs) {
+      const tag = imgM[0];
+      const altM = tag.match(/alt=["']([^"']*)["']/i);
+      const titleM = tag.match(/title=["']([^"']*)["']/i);
+      const imgAlt = altM ? altM[1] : '';
+      const imgTitle = titleM ? titleM[1] : '';
+      addImage(imgM[1], [imgAlt, imgTitle, figCaption].filter(Boolean).join(' '));
+    }
+  }
+
   const imgMatches = container.matchAll(/<img[^>]+(?:src|data-src)=["']([^"']+)["'][^>]*>/gi);
   for (const match of imgMatches) {
-    addImage(match[1]);
+    const tag = match[0];
+    const altM = tag.match(/alt=["']([^"']*)["']/i);
+    const titleM = tag.match(/title=["']([^"']*)["']/i);
+    const imgAlt = altM ? altM[1] : '';
+    const imgTitle = titleM ? titleM[1] : '';
+    addImage(match[1], [imgAlt, imgTitle].filter(Boolean).join(' '));
   }
 
   const srcsetMatches = container.matchAll(/(?:srcset|data-srcset)=["']([^"']+)["']/gi);
@@ -131,12 +171,13 @@ export function extractImagesFromArticleHtml(html: string, pageUrl: string): str
 }
 
 /**
- * Extracts image URLs from raw RSS item string or XML node
+ * Extracts image URLs from raw RSS item string or XML node,
+ * filtering out any images whose URL or associated captions/media tags match active citation anonymizer rules.
  */
-export function extractImagesFromItemXml(itemXml: string): string[] {
+export function extractImagesFromItemXml(itemXml: string, rules?: ReplacementRule[]): string[] {
   const images: string[] = [];
 
-  const addImage = (url: string) => {
+  const addImage = (url: string, metaText: string = '') => {
     if (!url) return;
     let cleanUrl = url.replace(/&amp;/g, '&').trim();
 
@@ -145,10 +186,26 @@ export function extractImagesFromItemXml(itemXml: string): string[] {
       cleanUrl = cleanUrl.replace(/=s0-w\d+.*|=w\d+.*/, '=s0-w1200');
     }
 
+    if (rules && rules.length > 0) {
+      if (isImageMatchingRules(cleanUrl, rules, metaText)) {
+        return;
+      }
+    }
+
     if ((cleanUrl.startsWith('http://') || cleanUrl.startsWith('https://')) && !images.includes(cleanUrl)) {
       images.push(cleanUrl);
     }
   };
+
+  // Extract item-level media metadata (media:title, media:description, media:credit)
+  const mediaDescMatch = itemXml.match(/<media:description[^>]*>([\s\S]*?)<\/media:description>/i);
+  const mediaTitleMatch = itemXml.match(/<media:title[^>]*>([\s\S]*?)<\/media:title>/i);
+  const mediaCreditMatch = itemXml.match(/<media:credit[^>]*>([\s\S]*?)<\/media:credit>/i);
+  const itemMediaMeta = [
+    mediaDescMatch ? mediaDescMatch[1].replace(/<[^>]+>/g, ' ') : '',
+    mediaTitleMatch ? mediaTitleMatch[1].replace(/<[^>]+>/g, ' ') : '',
+    mediaCreditMatch ? mediaCreditMatch[1].replace(/<[^>]+>/g, ' ') : '',
+  ].filter(Boolean).join(' ');
 
   // 1. Check media:content, media:thumbnail, media:group tags
   const mediaMatches = itemXml.matchAll(/<media:(?:content|thumbnail|group)[\s\S]*?>/gi);
@@ -156,26 +213,31 @@ export function extractImagesFromItemXml(itemXml: string): string[] {
     const tag = match[0];
     const urlMatch = tag.match(/url=["']([^"']+)["']/i);
     if (urlMatch) {
-      addImage(urlMatch[1]);
+      addImage(urlMatch[1], itemMediaMeta);
     }
   }
 
   // 2. Check enclosure or atom:link url/href="..."
   const enclosureMatches = itemXml.matchAll(/<(?:enclosure|atom:link)[^>]+(?:url|href)=["']([^"']+)["'][^>]*>/gi);
   for (const match of enclosureMatches) {
-    addImage(match[1]);
+    addImage(match[1], itemMediaMeta);
   }
 
   // 3. Check <img> tags inside description or content
   const imgMatches = itemXml.matchAll(/<img[^>]+(?:src|data-src)=["']([^"']+)["'][^>]*>/gi);
   for (const match of imgMatches) {
-    addImage(match[1]);
+    const tag = match[0];
+    const altM = tag.match(/alt=["']([^"']*)["']/i);
+    const titleM = tag.match(/title=["']([^"']*)["']/i);
+    const imgAlt = altM ? altM[1] : '';
+    const imgTitle = titleM ? titleM[1] : '';
+    addImage(match[1], [imgAlt, imgTitle, itemMediaMeta].filter(Boolean).join(' '));
   }
 
   // 4. Fallback: match general image URLs in the XML string
   const rawUrlMatches = itemXml.matchAll(/(https?:\/\/[^\s"']+\.(?:png|jpg|jpeg|webp|gif)(?:\?[^\s"']*)?)/gi);
   for (const match of rawUrlMatches) {
-    addImage(match[1]);
+    addImage(match[1], itemMediaMeta);
   }
 
   const excludeKeywords = ['pixel', 'avatar', 'badge', '1x1', 'favicon', 'tracking', 'spacer', 'ad.doubleclick', 'logo', 'footer', 'icon'];
@@ -306,8 +368,11 @@ export function stripHtml(str: string): string {
     text = decodeHtmlEntities(text);
   }
 
-  // 4. Strip boilerplate RSS footer links & JSON/Schema artifacts & media player junk
+  // 4. Strip boilerplate RSS footer links & JSON/Schema artifacts & media player junk & CDATA markers
   text = text
+    .replace(/<!\[CDATA\[/gi, '')
+    .replace(/\]\]>/g, '')
+    .replace(/^\]+>\s*/g, '')
     .replace(/\b(continue reading|read more|full story)\b\.*/gi, '')
     .replace(/"@type"\s*:\s*"[^"]*"/gi, '')
     .replace(/"Headline"\s*:\s*"/gi, '')
@@ -517,22 +582,21 @@ export function ensureParagraphBreaks(str: string): string[] {
 /**
  * Parse raw RSS XML text into RawNewsItem list using regex (environment agnostic)
  */
-export function parseRssXml(xmlText: string, sourceName: string, sourceUrl: string): RawNewsItem[] {
+export function parseRssXml(xmlText: string, sourceName: string, sourceUrl: string, rules?: ReplacementRule[]): RawNewsItem[] {
   const items: RawNewsItem[] = [];
   const itemRegex = /<item[\s\S]*?<\/item>/gi;
   const matches = xmlText.match(itemRegex) || [];
 
   matches.forEach((itemXml, index) => {
     const getTag = (tag: string) => {
-      const cdataRegex = new RegExp(`<${tag}[^>]*><!\\[CDATA\\[([\\s\\S]*?)\\]\\]><\\/${tag}>`, 'i');
-      const cdataMatch = itemXml.match(cdataRegex);
-      if (cdataMatch) return cdataMatch[1].trim();
-
-      const simpleRegex = new RegExp(`<${tag}[^>]*>([\\s\\S]*?)<\\/${tag}>`, 'i');
-      const simpleMatch = itemXml.match(simpleRegex);
-      if (simpleMatch) return simpleMatch[1].trim();
-
-      return '';
+      const tagRegex = new RegExp(`<${tag}[^>]*>([\\s\\S]*?)<\\/${tag}>`, 'i');
+      const match = itemXml.match(tagRegex);
+      if (!match) return '';
+      let content = match[1];
+      // Unpack CDATA sections and clean stray delimiters
+      content = content.replace(/<!\[CDATA\[([\s\S]*?)\]\]>/gi, '$1');
+      content = content.replace(/<!\[CDATA\[/gi, '').replace(/\]\]>/g, '').replace(/^\]+>\s*/g, '');
+      return content.trim();
     };
 
     const titleRaw = getTag('title');
@@ -571,7 +635,7 @@ export function parseRssXml(xmlText: string, sourceName: string, sourceUrl: stri
       if (!isNaN(parsed.getTime())) pubDate = parsed;
     }
 
-    const images = extractImagesFromItemXml(itemXml);
+    const images = extractImagesFromItemXml(itemXml, rules);
 
     items.push({
       id: `${sourceName.toLowerCase().replace(/\s+/g, '-')}-${index}-${Date.now()}`,
@@ -830,6 +894,12 @@ export function isImageMatchingRules(
 export function cleanLiveblogAndRoundupArtifacts(text: string): string {
   if (!text) return '';
   let cleaned = text;
+
+  // Strips CDATA fragments and stray closing brackets
+  cleaned = cleaned
+    .replace(/<!\[CDATA\[/gi, '')
+    .replace(/\]\]>/g, '')
+    .replace(/^\]+>\s*/g, '');
 
   // Strips liveblog transitions like "Back to Ukraine, where Nine people...", "Back to Glasgow, where..."
   cleaned = cleaned.replace(/\bBack to [A-Z][a-zA-Z\s\-]+,\s*where\b[^\.\!\?\n]*[\.\!\?]?/g, '');
@@ -1448,7 +1518,7 @@ export function synthesizeLocalFallback(
       id: `synth-${index}-${Date.now()}`,
       title: cleanTitle,
       summary: cleanSummary,
-      fullDetails: cleanFullDetails,
+      fullDetails: cleanFullDetails || cleanSummary,
       sources: sourceNames,
       sourceLinks: uniqueSourceLinks,
       images,
@@ -1458,7 +1528,7 @@ export function synthesizeLocalFallback(
       topicTag,
       matchedTopic,
     };
-  }).filter(art => hasSufficientArticleDetails(art.fullDetails, art.title, art.summary));
+  }).filter(art => Boolean(art.title && art.title.trim().length > 0));
 
   // Prioritize 'Following' articles, balance neutral articles, and place 'Occasional' articles lower
   initialSynthesized.sort((a, b) => {

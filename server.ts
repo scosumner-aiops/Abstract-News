@@ -188,6 +188,7 @@ import {
   hasSufficientArticleDetails
 } from './src/utils/rss';
 import { RawNewsItem, ReplacementRule, SynthesizedArticle, TopicPreference } from './src/types';
+import { isNonEnglishText } from './src/utils/language';
 import { DEFAULT_SOURCES, DEFAULT_RULES, DEFAULT_TOPIC_PREFERENCES } from './src/utils/defaultSettings';
 
 declare module 'express-session' {
@@ -412,12 +413,17 @@ app.set('trust proxy', 1);
     const activeRules = rules.filter(r => r.enabled && r.term && r.term.trim().length > 0);
     if (activeRules.length === 0) return false;
 
+    // Fast-path: check if URL, filename, or slug matches citation anonymizer terms
+    if (isImageMatchingRules(imageUrl, activeRules)) {
+      return true;
+    }
+
     // Skip Vision API calls if quota was exceeded recently
     if (Date.now() < visionQuotaCooldownUntil) {
       return false;
     }
 
-    const termsList = activeRules.map(r => r.term.trim());
+    const termsList = activeRules.map(r => r.term.trim()).filter(Boolean);
     const cacheKey = `${imageUrl}::${termsList.sort().join('|')}`;
 
     if (visionCache.has(cacheKey)) {
@@ -426,12 +432,13 @@ app.set('trust proxy', 1);
 
     try {
       const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 3500);
+      const timeout = setTimeout(() => controller.abort(), 5000);
 
       const imageRes = await fetch(imageUrl, {
         signal: controller.signal,
         headers: {
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
         },
       });
       clearTimeout(timeout);
@@ -440,14 +447,24 @@ app.set('trust proxy', 1);
         return false;
       }
 
-      const arrayBuffer = await imageRes.arrayBuffer();
-      const buffer = Buffer.from(arrayBuffer);
-
-      if (buffer.length < 500 || buffer.length > 12 * 1024 * 1024) {
+      const contentType = (imageRes.headers.get('content-type') || '').toLowerCase();
+      if (!contentType.startsWith('image/')) {
         return false;
       }
 
-      const contentType = imageRes.headers.get('content-type') || 'image/jpeg';
+      const arrayBuffer = await imageRes.arrayBuffer();
+      const buffer = Buffer.from(arrayBuffer);
+
+      if (buffer.length < 500 || buffer.length > 15 * 1024 * 1024) {
+        return false;
+      }
+
+      // Safeguard against HTML error pages returned with image content-type
+      const firstChunk = buffer.slice(0, 16).toString('utf8').toLowerCase();
+      if (firstChunk.includes('<!') || firstChunk.includes('<html') || firstChunk.includes('<?xml')) {
+        return false;
+      }
+
       let mimeType = 'image/jpeg';
       if (contentType.includes('png')) mimeType = 'image/png';
       else if (contentType.includes('webp')) mimeType = 'image/webp';
@@ -455,31 +472,51 @@ app.set('trust proxy', 1);
 
       const base64Data = buffer.toString('base64');
 
-      const prompt = `You are a strict media anonymization & citation filter. Your job is to analyze this news photo and detect if ANY of the following prohibited people, public figures, brands, or entities are visually depicted or present anywhere in the image:
+      const prompt = `You are a strict news media anonymizer and citation filter.
+The following is the active citation anonymizer list of prohibited public figures or entities:
 ${termsList.map(t => `- "${t}"`).join('\n')}
 
-Inspect facial features, prominent logos, text on apparel/signs, or well-known public individuals.
-Does this image show, feature, or contain ANY of the prohibited subjects listed above?
+Analyze this news photograph with extreme scrutiny:
+1. Thoroughly inspect EVERY individual person depicted anywhere in the image (foreground, background, seated at desks or tables, standing, speaking at podiums, attending summits or bilateral meetings, or walking).
+2. CRITICAL MANDATE: If ANY of the prohibited individuals from the list above appears anywhere in this image—even if they are sitting or standing next to another leader, foreign prime minister, host, or official (such as in bilateral meetings, trade negotiations, summits, or joint press conferences)—you MUST identify them and flag the image as forbidden.
+3. Check recognizable facial features, hair, profile, body shape, and name placards.
+4. If ANY prohibited individual is visually depicted or present, respond strictly with JSON:
+   {"forbidden": true, "detected": "Name of prohibited person"}
+5. If NO prohibited individuals are present in this image, respond strictly with JSON:
+   {"forbidden": false, "detected": ""}`;
 
-Respond ONLY with valid JSON:
-{"forbidden": true/false, "detected": "Name of detected subject or empty string"}`;
+      const modelsToTry = ['gemini-3.1-flash-lite', 'gemini-3.5-flash-lite'];
+      let visionResponse: any = null;
 
-      const visionResponse = await ai.models.generateContent({
-        model: 'gemini-3.1-flash-lite',
-        contents: [
-          {
-            inlineData: {
-              data: base64Data,
-              mimeType,
+      for (const model of modelsToTry) {
+        try {
+          visionResponse = await ai.models.generateContent({
+            model,
+            contents: [
+              {
+                inlineData: {
+                  data: base64Data,
+                  mimeType,
+                },
+              },
+              { text: prompt },
+            ],
+            config: {
+              responseMimeType: 'application/json',
+              temperature: 0.0,
             },
-          },
-          { text: prompt },
-        ],
-        config: {
-          responseMimeType: 'application/json',
-          temperature: 0.0,
-        },
-      });
+          });
+          if (visionResponse && visionResponse.text) {
+            break;
+          }
+        } catch (modelErr: any) {
+          const errMsg = (modelErr?.message || modelErr?.toString() || '').toLowerCase();
+          if (errMsg.includes('429') || errMsg.includes('quota') || errMsg.includes('resource_exhausted')) {
+            visionQuotaCooldownUntil = Date.now() + 3 * 60 * 1000;
+            break;
+          }
+        }
+      }
 
       if (visionResponse && visionResponse.text) {
         const parsed = JSON.parse(visionResponse.text);
@@ -493,7 +530,7 @@ Respond ONLY with valid JSON:
     } catch (err: any) {
       const errMsg = (err?.message || err?.toString() || JSON.stringify(err) || '').toLowerCase();
       if (errMsg.includes('429') || errMsg.includes('quota') || errMsg.includes('resource_exhausted')) {
-        visionQuotaCooldownUntil = Date.now() + 5 * 60 * 1000; // 5 minute cooldown
+        visionQuotaCooldownUntil = Date.now() + 3 * 60 * 1000;
         console.log('[Vision Anonymizer] Vision API rate limit / quota reached. Falling back to text-rule image filters.');
       }
     }
@@ -514,36 +551,48 @@ Respond ONLY with valid JSON:
 
     console.log(`[Vision Anonymizer] Scanning article images against ${activeRules.length} active rule(s)...`);
 
-    let scannedCount = 0;
-    const maxScansPerPass = 3; // Limit vision API requests per pass to preserve quota
+    // Collect all candidate image URLs across all articles
+    const allUrls = Array.from(
+      new Set(articles.flatMap(a => a.images || []).filter(img => !isImageMatchingRules(img, activeRules)))
+    );
 
-    const result: SynthesizedArticle[] = [];
-    for (const art of articles) {
-      if (!art.images || art.images.length === 0 || scannedCount >= maxScansPerPass || Date.now() < visionQuotaCooldownUntil) {
-        result.push(art);
-        continue;
-      }
-
-      const checkedImages: string[] = [];
-      for (const imgUrl of art.images) {
-        if (scannedCount < maxScansPerPass && Date.now() >= visionQuotaCooldownUntil) {
-          scannedCount++;
-          const isForbidden = await checkImageVisionForbidden(imgUrl, rules, ai);
-          if (!isForbidden) {
-            checkedImages.push(imgUrl);
-          }
-        } else {
-          checkedImages.push(imgUrl);
-        }
-      }
-
-      result.push({
+    if (allUrls.length === 0) {
+      return articles.map(art => ({
         ...art,
-        images: checkedImages,
-      });
+        images: (art.images || []).filter(img => !isImageMatchingRules(img, activeRules)),
+      }));
     }
 
-    return result;
+    const forbiddenMap = new Map<string, boolean>();
+    const batchSize = 5;
+
+    for (let i = 0; i < allUrls.length; i += batchSize) {
+      if (Date.now() < visionQuotaCooldownUntil) break;
+      const batch = allUrls.slice(i, i + batchSize);
+      await Promise.all(
+        batch.map(async (url) => {
+          try {
+            const isForbidden = await checkImageVisionForbidden(url, activeRules, ai);
+            forbiddenMap.set(url, isForbidden);
+          } catch {
+            forbiddenMap.set(url, false);
+          }
+        })
+      );
+    }
+
+    return articles.map(art => {
+      if (!art.images || art.images.length === 0) return art;
+      const cleanImages = art.images.filter(img => {
+        if (isImageMatchingRules(img, activeRules)) return false;
+        if (forbiddenMap.get(img) === true) return false;
+        return true;
+      });
+      return {
+        ...art,
+        images: cleanImages,
+      };
+    });
   }
 
   // Global Request Logger for API and Auth routes
@@ -1432,7 +1481,7 @@ Return JSON with a "translations" array containing objects with "id", "title", a
           });
           if (artRes.ok) {
             const html = await artRes.text();
-            const extracted = extractImagesFromArticleHtml(html, itemLink);
+            const extracted = extractImagesFromArticleHtml(html, itemLink, rules);
             const clean = extracted.filter(img => !isGoogleNewsPlaceholder(img) && !isImageMatchingRules(img, rules));
             if (clean.length > 0) return clean;
           }
@@ -1465,7 +1514,7 @@ Return JSON with a "translations" array containing objects with "id", "title", a
                 });
                 if (pageRes.ok) {
                   const html = await pageRes.text();
-                  const scraped = extractImagesFromArticleHtml(html, linkUrl);
+                  const scraped = extractImagesFromArticleHtml(html, linkUrl, rules);
                   scraped.forEach((img) => {
                     if (!art.images.includes(img) && !isGoogleNewsPlaceholder(img) && !isImageMatchingRules(img, rules)) {
                       art.images.push(img);
@@ -1486,6 +1535,90 @@ Return JSON with a "translations" array containing objects with "id", "title", a
         }
       })
     );
+    return articles;
+  }
+
+  async function ensureArticlesInEnglish(
+    articles: SynthesizedArticle[],
+    ai: GoogleGenAI | null,
+    rules: ReplacementRule[]
+  ): Promise<SynthesizedArticle[]> {
+    const nonEnglishIndices: number[] = [];
+    articles.forEach((art, idx) => {
+      const sample = `${art.title} ${art.summary || ''}`;
+      if (isNonEnglishText(sample)) {
+        nonEnglishIndices.push(idx);
+      }
+    });
+
+    if (nonEnglishIndices.length === 0) return articles;
+
+    console.log(`[Translation] Detected ${nonEnglishIndices.length} non-English article(s). Translating to English before publishing...`);
+
+    if (!ai) return articles;
+
+    await Promise.all(
+      nonEnglishIndices.map(async (idx) => {
+        const art = articles[idx];
+        try {
+          const prompt = `You are a world-class news editor and professional journalistic translator.
+Translate the following news story completely and fluently into professional, journalistic ENGLISH before publishing.
+- CRITICAL: Title, summary, and full details MUST be in clear, natural English.
+- Preserve all concrete facts, names, dates, quotes, figures, and meaning accurately.
+- Completely strip any remaining HTML, CDATA tags, and stray delimiters (like "]]>").
+- Do NOT output any preamble, meta-comments, or explanatory notes.
+
+Story to translate:
+Title: ${art.title}
+Summary: ${art.summary || ''}
+Full Details: ${art.fullDetails || ''}
+
+Return valid JSON adhering strictly to:
+{
+  "title": "Natural journalistic headline in English",
+  "summary": "Crisp 1-2 sentence executive summary in English (approx 25-45 words)",
+  "fullDetails": "2-4 paragraphs with concrete facts and numbers in English"
+}`;
+
+          const translationModels = ['gemini-3.1-flash-lite', 'gemini-2.5-flash', 'gemini-3.5-flash-lite'];
+          let translatedText = '';
+
+          for (const modelName of translationModels) {
+            try {
+              const resp = await ai.models.generateContent({
+                model: modelName,
+                contents: prompt,
+                config: {
+                  responseMimeType: 'application/json',
+                  temperature: 0.1,
+                },
+              });
+              translatedText = resp.text || '';
+              if (translatedText) break;
+            } catch (mErr: any) {
+              // Try next model
+            }
+          }
+
+          if (!translatedText) return;
+
+          const parsed = JSON.parse(translatedText);
+          if (parsed.title) {
+            art.title = cleanCitationGrammarGlitches(stripHtml(cleanLiveblogAndRoundupArtifacts(applyReplacements(parsed.title, rules))));
+          }
+          if (parsed.summary) {
+            art.summary = cleanCitationGrammarGlitches(cleanMediaAudioVideoJunk(formatConciseSummary(cleanLiveblogAndRoundupArtifacts(applyReplacements(parsed.summary, rules)))));
+          }
+          if (parsed.fullDetails) {
+            art.fullDetails = cleanCitationGrammarGlitches(cleanMediaAudioVideoJunk(cleanLiveblogAndRoundupArtifacts(applyReplacements(parsed.fullDetails, rules))));
+          }
+          console.log(`[Translation] Successfully translated to English: "${art.title}"`);
+        } catch (err: any) {
+          console.error(`[Translation Error] Failed translating article "${art.title}":`, err.message);
+        }
+      })
+    );
+
     return articles;
   }
 
@@ -1579,7 +1712,12 @@ Your task:
    - You MUST NEVER mix, concatenate, or blend unrelated news events, different sports matches, or separate geopolitical stories into the same article, summary, or fullDetails body.
    - LIVEBLOG / ROUNDUP CLEANUP: Raw feed entries may contain live blogs or roundups with transition phrases (e.g., "Back to Ukraine, where...", "In other news...", "Here are this week's other releases...", "Meanwhile...", "Live updates:"). You MUST extract ONLY the primary main story topic of that entry and COMPLETELY STRIP/REMOVE all unrelated side updates, transition sentences, secondary product announcements, or off-topic roundup lists.
 
-3. SIMPLIFIED, DIRECT LANGUAGE & HIGH-DENSITY REPORTING (CRITICAL):
+3. MANDATORY ENGLISH TRANSLATION & PUBLISHING STANDARD (CRITICAL):
+   - ALL synthesized articles (including 'title', 'summary', 'fullDetails', and 'category') MUST be written in fluent, natural, journalistic ENGLISH.
+   - If any input feed item or story is written in Portuguese (such as Globo G1), Spanish, French, German, Italian, Russian, Arabic, Chinese, Japanese, or ANY language other than English, YOU MUST ACCURATELY AND COMPLETELY TRANSLATE AND SYNTHESIZE IT ENTIRELY INTO CLEAR, FLUENT ENGLISH.
+   - You are STRICTLY FORBIDDEN from publishing foreign language headlines, summaries, or details. All output stories must be translated into English before publishing.
+
+4. SIMPLIFIED, DIRECT LANGUAGE & HIGH-DENSITY REPORTING (CRITICAL):
    a. PLAIN, DIRECT LANGUAGE — NO WORDINESS, NO FILLER:
       - Write in clean, straightforward, plain English. Get straight to the point.
       - Use active voice and crisp, concise sentences. Avoid passive, winding phrasing.
@@ -1633,6 +1771,12 @@ ${activeRules.map(r => `      * Replace: "${r.term}" -> With: "${r.replacement}"
       - PRESERVE REAL PEOPLE & OFFICIALS: If a person (e.g., Keir Starmer, Emmanuel Macron, Volodymyr Zelenskyy, Mark Carney, or any other official or individual) is NOT on the forbidden list, YOU MUST EXPLICITLY NAME THEM with their actual name and real title. Do NOT say "a European leader", "a foreign minister", "a prominent politician", or "authorities".
       - PRESERVE REAL COMPANIES & ORGANIZATIONS: Unless a specific company or organization is explicitly on the block list, name them directly (e.g., Apple, Boeing, NATO, the United Nations, FIFA, OpenAI, etc.).
       - WRITE CONCRETE, VIVID, FACTUAL JOURNALISM: The articles must be specific, grounded, and factual, never vague or abstract. Only replace the specific terms explicitly listed in the replacement rules above.
+
+   c. CITATION ANONYMIZER RULES ARE NEVER A REASON NOT TO PUBLISH AN ARTICLE (CRITICAL MANDATE):
+      - DO NOT SUPPRESS, DROP, OR OMIT ARTICLES: If an important news event or major story involves a person, entity, or leader on the citation anonymizer list, YOU MUST ALWAYS SYNTHESIZE AND PUBLISH THAT ARTICLE!
+      - Citation anonymizer rules are strictly textual replacements (replacing the prohibited name with their natural title or role, such as "the U.S. president") and visual image filters (suppressing photos that depict them).
+      - Having a subject on the citation anonymizer list, or having an associated image filtered out or removed, is ABSOLUTELY NOT A REASON TO NOT PUBLISH THE ARTICLE.
+      - Every relevant story must be published, regardless of whether its imagery is suppressed or absent. You simply do not show any images that show that rule.
 
 5. Plain Text Formatting:
    You MUST NEVER output HTML tags (such as <p>, <a>, <div>, <br>, <span>) anywhere in returned title, summary, or fullDetails fields. All text must be clean, readable plain text.
@@ -1798,7 +1942,7 @@ ${seeLessTopics.map(t => `  * "${t}": De-emphasize and downweight coverage on th
                   id: `ai-synth-${idx}-${Date.now()}`,
                   title: cleanTitle,
                   summary: cleanSummary,
-                  fullDetails: cleanFullDetails,
+                  fullDetails: cleanFullDetails || cleanSummary,
                   sources: art.sources || matchedItems.map(m => m.sourceName),
                   sourceLinks: sourceLinks.length > 0 ? sourceLinks : [{ name: 'Source', url: matchedItems[0]?.link || '#' }],
                   images,
@@ -1808,7 +1952,7 @@ ${seeLessTopics.map(t => `  * "${t}": De-emphasize and downweight coverage on th
                   topicTag,
                   matchedTopic: topicTag ? matchedTopic : undefined,
                 };
-              }).filter(art => hasSufficientArticleDetails(art.fullDetails, art.title, art.summary));
+              }).filter(art => Boolean(art.title && art.title.trim().length > 0));
 
               // Apply post-synthesis duplicate merging pass to combine any remaining overlapping topics
               const deduplicatedArticles = mergeDuplicateSynthesizedArticles(synthesizedArticles).slice(0, 25);
@@ -1820,11 +1964,14 @@ ${seeLessTopics.map(t => `  * "${t}": De-emphasize and downweight coverage on th
                 return scoreB - scoreA;
               });
 
+              // Ensure non-English articles are translated to English before publishing
+              const englishArticles = await ensureArticlesInEnglish(deduplicatedArticles, ai, rules);
+
               // Ensure every article has lead imagery via fallback fetch if missing
-              await ensureImagesForArticles(deduplicatedArticles, rules);
+              await ensureImagesForArticles(englishArticles, rules);
 
               // Filter article images with Gemini Vision against active rules
-              const cleanArticles = await filterArticleImagesWithVision(deduplicatedArticles, rules, ai);
+              const cleanArticles = await filterArticleImagesWithVision(englishArticles, rules, ai);
 
               res.json({
                 articles: cleanArticles,
@@ -1843,8 +1990,9 @@ ${seeLessTopics.map(t => `  * "${t}": De-emphasize and downweight coverage on th
 
       // Fallback local engine
       const fallbackArticles = synthesizeLocalFallback(items, rules, timeframeHours, primarySourceName, topics);
-      await ensureImagesForArticles(fallbackArticles, rules);
-      const cleanFallbackArticles = await filterArticleImagesWithVision(fallbackArticles, rules, ai);
+      const englishFallbackArticles = ai ? await ensureArticlesInEnglish(fallbackArticles, ai, rules) : fallbackArticles;
+      await ensureImagesForArticles(englishFallbackArticles, rules);
+      const cleanFallbackArticles = await filterArticleImagesWithVision(englishFallbackArticles, rules, ai);
       res.json({
         articles: cleanFallbackArticles,
         isAI: false,
@@ -1853,6 +2001,80 @@ ${seeLessTopics.map(t => `  * "${t}": De-emphasize and downweight coverage on th
     } catch (error: any) {
       console.error('Error in /api/synthesize:', error);
       res.status(500).json({ error: error.message || 'Synthesize operation failed' });
+    }
+  });
+
+  // 4. On-demand Article Translation Endpoint
+  app.post('/api/translate', async (req, res) => {
+    try {
+      const { articles, rules = [] } = req.body as { articles: SynthesizedArticle[]; rules: ReplacementRule[] };
+      if (!articles || !Array.isArray(articles)) {
+        res.status(400).json({ error: 'Articles array is required' });
+        return;
+      }
+      const ai = getGeminiClient();
+      if (!ai) {
+        res.status(400).json({ error: 'Gemini client is currently unavailable' });
+        return;
+      }
+      const translated = await ensureArticlesInEnglish(articles, ai, rules);
+      res.json({ articles: translated });
+    } catch (err: any) {
+      console.error('Error in /api/translate:', err);
+      res.status(500).json({ error: err.message || 'Translation failed' });
+    }
+  });
+
+  // 5. Verification Endpoint: Check candidate image URLs against Citation Anonymizer rules (Text & Gemini Vision)
+  app.post('/api/images/check-rules', async (req, res) => {
+    try {
+      const { imageUrls = [], rules = [] } = req.body as { imageUrls: string[]; rules: ReplacementRule[] };
+      if (!Array.isArray(imageUrls) || imageUrls.length === 0) {
+        res.json({ blockedUrls: [], allowedUrls: [] });
+        return;
+      }
+
+      const activeRules = (rules || []).filter(r => r.enabled && r.term && r.term.trim().length > 0);
+      if (activeRules.length === 0) {
+        res.json({ blockedUrls: [], allowedUrls: imageUrls });
+        return;
+      }
+
+      const ai = getGeminiClient();
+      const blockedUrls: string[] = [];
+      const allowedUrls: string[] = [];
+
+      await Promise.all(
+        imageUrls.map(async (url) => {
+          if (!url || typeof url !== 'string') return;
+
+          // 1. Text/URL matching
+          if (isImageMatchingRules(url, activeRules)) {
+            blockedUrls.push(url);
+            return;
+          }
+
+          // 2. Vision API check
+          if (ai) {
+            try {
+              const isForbidden = await checkImageVisionForbidden(url, activeRules, ai);
+              if (isForbidden) {
+                blockedUrls.push(url);
+                return;
+              }
+            } catch {
+              // If check fails, allow
+            }
+          }
+
+          allowedUrls.push(url);
+        })
+      );
+
+      res.json({ blockedUrls, allowedUrls });
+    } catch (err: any) {
+      console.error('Error in /api/images/check-rules:', err);
+      res.status(500).json({ error: err.message || 'Image check failed' });
     }
   });
 

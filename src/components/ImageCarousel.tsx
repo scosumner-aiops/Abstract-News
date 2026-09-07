@@ -38,6 +38,18 @@ function getNormalizedImageKey(url: string): string {
   }
 }
 
+// Global in-memory cache for client-side image verification against rules
+const clientImageRulesCache = new Map<string, boolean>();
+
+function getRulesCacheKey(url: string, rules: ReplacementRule[]): string {
+  const terms = rules
+    .filter((r) => r.enabled && r.term.trim())
+    .map((r) => r.term.trim().toLowerCase())
+    .sort()
+    .join('|');
+  return `${url}:::${terms}`;
+}
+
 export const ImageCarousel: React.FC<ImageCarouselProps> = ({
   images,
   articleTitle,
@@ -134,8 +146,51 @@ export const ImageCarousel: React.FC<ImageCarouselProps> = ({
           .sort((a, b) => b.area - a.area)
           .map((m) => m.url);
 
-        setValidImages(sortedHighResUrls);
-        setIsChecking(false);
+        let finalUrls = sortedHighResUrls;
+        const activeRules = (rules || []).filter((r) => r.enabled && r.term.trim().length > 0);
+
+        if (activeRules.length > 0 && sortedHighResUrls.length > 0) {
+          const uncachedUrls = sortedHighResUrls.filter(
+            (u) => clientImageRulesCache.get(getRulesCacheKey(u, activeRules)) === undefined
+          );
+
+          if (uncachedUrls.length > 0) {
+            try {
+              const res = await fetch('/api/images/check-rules', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  imageUrls: uncachedUrls,
+                  rules: activeRules,
+                }),
+              });
+              if (res.ok) {
+                const data = await res.json();
+                if (data && Array.isArray(data.blockedUrls)) {
+                  data.blockedUrls.forEach((u: string) => {
+                    clientImageRulesCache.set(getRulesCacheKey(u, activeRules), true);
+                  });
+                }
+                if (data && Array.isArray(data.allowedUrls)) {
+                  data.allowedUrls.forEach((u: string) => {
+                    clientImageRulesCache.set(getRulesCacheKey(u, activeRules), false);
+                  });
+                }
+              }
+            } catch (err) {
+              console.warn('Image rules check error:', err);
+            }
+          }
+
+          finalUrls = sortedHighResUrls.filter(
+            (u) => clientImageRulesCache.get(getRulesCacheKey(u, activeRules)) !== true
+          );
+        }
+
+        if (isMounted) {
+          setValidImages(finalUrls);
+          setIsChecking(false);
+        }
       }
     };
 
