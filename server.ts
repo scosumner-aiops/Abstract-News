@@ -3,7 +3,6 @@ import path from 'path';
 import fs from 'fs';
 import session from 'express-session';
 import cookieParser from 'cookie-parser';
-import { createServer as createViteServer } from 'vite';
 import { GoogleGenAI, Type } from '@google/genai';
 
 function jsToFirestoreValue(val: any): any {
@@ -75,9 +74,9 @@ function getFirestoreConfig() {
     }
   }
   return {
-    projectId: firestoreConfig.projectId || 'lucky-blend-9wjkk',
-    apiKey: firestoreConfig.apiKey || '',
-    databaseId: firestoreConfig.firestoreDatabaseId || firestoreConfig.databaseId || 'ai-studio-abstractnews-5dac5c76-1bd6-4159-9e3f-fb2da2d47328',
+    projectId: process.env.FIREBASE_PROJECT_ID || firestoreConfig.projectId || 'lucky-blend-9wjkk',
+    apiKey: process.env.FIREBASE_API_KEY || firestoreConfig.apiKey || 'AIzaSyCp_DMGJj2yMfPr5-sDqsqyZZ2XooTzFhw',
+    databaseId: process.env.FIRESTORE_DATABASE_ID || firestoreConfig.firestoreDatabaseId || firestoreConfig.databaseId || 'ai-studio-abstractnews-5dac5c76-1bd6-4159-9e3f-fb2da2d47328',
   };
 }
 
@@ -204,14 +203,10 @@ declare module 'express-session' {
   }
 }
 
-async function startServer() {
-  const app = express();
-  const PORT = 3000;
+export const app = express();
 
-  // Trust proxy for Cloud Run/container environments
-  app.set('trust proxy', 1);
-
-  await initializeDefaultSettings();
+// Trust proxy for Cloud Run, Vercel, and reverse proxies
+app.set('trust proxy', 1);
 
   app.use(express.json({ limit: '10mb' }));
   app.use(cookieParser());
@@ -1635,23 +1630,35 @@ ${seeLessTopics.map(t => `  * "${t}": De-emphasize and downweight coverage on th
   });
 
   // Vite development middleware or static serving
-  if (process.env.NODE_ENV !== 'production') {
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: 'spa',
+  async function startServer() {
+    const PORT = 3000;
+    initializeDefaultSettings().catch((err) => {
+      console.warn('Background default settings initialization notice:', err);
     });
-    app.use(vite.middlewares);
-  } else {
-    const distPath = path.join(process.cwd(), 'dist');
-    app.use(express.static(distPath));
-    app.get('*', (req, res) => {
-      res.sendFile(path.join(distPath, 'index.html'));
+
+    if (process.env.NODE_ENV !== 'production') {
+      const { createServer: createViteServer } = await import('vite');
+      const vite = await createViteServer({
+        server: { middlewareMode: true },
+        appType: 'spa',
+      });
+      app.use(vite.middlewares);
+    } else {
+      const distPath = path.join(process.cwd(), 'dist');
+      app.use(express.static(distPath));
+      app.get('*', (req, res) => {
+        res.sendFile(path.join(distPath, 'index.html'));
+      });
+    }
+
+    app.listen(PORT, '0.0.0.0', () => {
+      console.log(`Server running on http://0.0.0.0:${PORT}`);
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Server running on http://0.0.0.0:${PORT}`);
-  });
-}
+  // Only start the standalone HTTP listener in non-Vercel environments (e.g. Cloud Run / local dev)
+  if (!process.env.VERCEL) {
+    startServer();
+  }
 
-startServer();
+  export default app;
