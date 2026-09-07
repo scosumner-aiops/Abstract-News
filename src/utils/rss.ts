@@ -1,7 +1,25 @@
 import { RawNewsItem, ReplacementRule, SynthesizedArticle, TopicPreference } from '../types';
 
 /**
- * Extracts image URLs from article HTML content (OpenGraph, Twitter card, or <img> tags)
+ * Helper to identify generic Google News logos, placeholder images, avatars, or icons
+ */
+export function isGoogleNewsPlaceholder(url: string): boolean {
+  if (!url) return true;
+  const lower = url.toLowerCase();
+  return (
+    lower.includes('googleusercontent.com/j6_') ||
+    lower.includes('googleusercontent.com/j6_cof') ||
+    lower.includes('news.google.com/logo') ||
+    lower.includes('gstatic.com') ||
+    lower.includes('google.com/images') ||
+    lower.includes('lh3.googleusercontent.com/proxy') ||
+    lower.includes('logo_') ||
+    lower.includes('favicon')
+  );
+}
+
+/**
+ * Extracts image URLs from article HTML content (JSON-LD structured data, OpenGraph, Twitter card, srcset, or <img> tags)
  */
 export function extractImagesFromArticleHtml(html: string, pageUrl: string): string[] {
   if (!html) return [];
@@ -10,13 +28,19 @@ export function extractImagesFromArticleHtml(html: string, pageUrl: string): str
   const addImage = (rawUrl: string) => {
     if (!rawUrl) return;
     try {
-      const cleanUrl = rawUrl.replace(/&amp;/g, '&').trim();
+      let cleanUrl = rawUrl.replace(/&amp;/g, '&').trim();
       let resolved = cleanUrl;
       if (cleanUrl.startsWith('//')) {
         resolved = 'https:' + cleanUrl;
       } else if (!cleanUrl.startsWith('http://') && !cleanUrl.startsWith('https://')) {
         resolved = new URL(cleanUrl, pageUrl).toString();
       }
+
+      // Upgrade Google content thumbnail URLs to high-resolution (1200px)
+      if (resolved.includes('googleusercontent.com')) {
+        resolved = resolved.replace(/=s0-w\d+.*|=w\d+.*/, '=s0-w1200');
+      }
+
       if ((resolved.startsWith('http://') || resolved.startsWith('https://')) && !images.includes(resolved)) {
         images.push(resolved);
       }
@@ -25,31 +49,55 @@ export function extractImagesFromArticleHtml(html: string, pageUrl: string): str
     }
   };
 
-  // 1. Meta OpenGraph images
-  const ogMatches = [
-    ...html.matchAll(/<meta[^>]+property=["']og:image(?::url)?["'][^>]+content=["']([^"']+)["']/gi),
-    ...html.matchAll(/<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:image(?::url)?["']/gi),
-  ];
-  for (const match of ogMatches) {
+  // 0. Parse JSON-LD structured data blocks (Schema.org NewsArticle / Article)
+  const jsonLdMatches = html.matchAll(/<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi);
+  for (const match of jsonLdMatches) {
+    try {
+      const jsonText = match[1].trim();
+      if (!jsonText) continue;
+      const parsed = JSON.parse(jsonText);
+      const items = Array.isArray(parsed) ? parsed : [parsed];
+      for (const obj of items) {
+        if (!obj || typeof obj !== 'object') continue;
+        if (typeof obj.image === 'string') {
+          addImage(obj.image);
+        } else if (Array.isArray(obj.image)) {
+          obj.image.forEach((imgItem: any) => {
+            if (typeof imgItem === 'string') addImage(imgItem);
+            else if (imgItem && typeof imgItem.url === 'string') addImage(imgItem.url);
+          });
+        } else if (obj.image && typeof obj.image.url === 'string') {
+          addImage(obj.image.url);
+        }
+        if (typeof obj.thumbnailUrl === 'string') {
+          addImage(obj.thumbnailUrl);
+        } else if (Array.isArray(obj.thumbnailUrl)) {
+          obj.thumbnailUrl.forEach((t: any) => { if (typeof t === 'string') addImage(t); });
+        }
+      }
+    } catch {
+      // ignore invalid JSON-LD
+    }
+  }
+
+  // 1. Meta OpenGraph, Twitter, Itemprop, Sailthru, Parsely tags
+  const metaMatches = html.matchAll(/<meta[^>]+(?:property|name|itemprop)=["'](?:og:image(?::url|:secure_url)?|twitter:image(?::src)?|image|sailthru\.image\.full|parsely-image)["'][^>]+content=["']([^"']+)["']/gi);
+  for (const match of metaMatches) {
     addImage(match[1]);
   }
 
-  // 2. Meta Twitter images
-  const twMatches = [
-    ...html.matchAll(/<meta[^>]+name=["']twitter:image(?::src)?["'][^>]+content=["']([^"']+)["']/gi),
-    ...html.matchAll(/<meta[^>]+content=["']([^"']+)["'][^>]+name=["']twitter:image(?::src)?["']/gi),
-  ];
-  for (const match of twMatches) {
+  const metaMatchesRev = html.matchAll(/<meta[^>]+content=["']([^"']+)["'][^>]+(?:property|name|itemprop)=["'](?:og:image(?::url|:secure_url)?|twitter:image(?::src)?|image|sailthru\.image\.full|parsely-image)["']/gi);
+  for (const match of metaMatchesRev) {
     addImage(match[1]);
   }
 
-  // 3. Link rel="image_src"
+  // 2. Link rel="image_src"
   const linkMatches = html.matchAll(/<link[^>]+rel=["']image_src["'][^>]+href=["']([^"']+)["']/gi);
   for (const match of linkMatches) {
     addImage(match[1]);
   }
 
-  // 4. Primary article image tags
+  // 3. Primary article container image tags & responsive srcsets
   const articleMatch =
     html.match(/<article[^>]*>([\s\S]*?)<\/article>/i) ||
     html.match(/<main[^>]*>([\s\S]*?)<\/main>/i) ||
@@ -61,12 +109,22 @@ export function extractImagesFromArticleHtml(html: string, pageUrl: string): str
     addImage(match[1]);
   }
 
+  const srcsetMatches = container.matchAll(/(?:srcset|data-srcset)=["']([^"']+)["']/gi);
+  for (const match of srcsetMatches) {
+    const candidates = match[1].split(',');
+    for (const cand of candidates) {
+      const parts = cand.trim().split(/\s+/);
+      if (parts[0]) addImage(parts[0]);
+    }
+  }
+
   const excludeKeywords = [
     'pixel', 'avatar', 'badge', '1x1', 'favicon', 'tracking', 'spacer',
     'ad.doubleclick', 'logo', 'footer', 'social', 'sprite', 'icon', 'button'
   ];
 
   return images.filter(url => {
+    if (isGoogleNewsPlaceholder(url)) return false;
     const lower = url.toLowerCase();
     return !excludeKeywords.some(k => lower.includes(k));
   });
@@ -80,7 +138,13 @@ export function extractImagesFromItemXml(itemXml: string): string[] {
 
   const addImage = (url: string) => {
     if (!url) return;
-    const cleanUrl = url.replace(/&amp;/g, '&').trim();
+    let cleanUrl = url.replace(/&amp;/g, '&').trim();
+
+    // Upgrade Google content thumbnail URLs to high-resolution (1200px)
+    if (cleanUrl.includes('googleusercontent.com')) {
+      cleanUrl = cleanUrl.replace(/=s0-w\d+.*|=w\d+.*/, '=s0-w1200');
+    }
+
     if ((cleanUrl.startsWith('http://') || cleanUrl.startsWith('https://')) && !images.includes(cleanUrl)) {
       images.push(cleanUrl);
     }
@@ -117,6 +181,7 @@ export function extractImagesFromItemXml(itemXml: string): string[] {
   const excludeKeywords = ['pixel', 'avatar', 'badge', '1x1', 'favicon', 'tracking', 'spacer', 'ad.doubleclick', 'logo', 'footer', 'icon'];
 
   return images.filter(url => {
+    if (isGoogleNewsPlaceholder(url)) return false;
     const lower = url.toLowerCase();
     return !excludeKeywords.some(k => lower.includes(k));
   });
@@ -665,15 +730,19 @@ export function applyReplacements(text: string, rules: ReplacementRule[]): strin
 }
 
 /**
- * Checks whether an image or its associated article context matches any forbidden citation anonymizer rules.
- * If an image matches a rule (by term, replacement phrase, URL path/filename, or article context), returns true.
+ * Checks whether an image matches any forbidden citation anonymizer rules.
+ * An image matches if its URL (filename, path) or explicit image caption/alt text
+ * identifies the image as depicting the prohibited subject.
+ * Note: Never check article body text or replacement phrases here, to avoid
+ * stripping valid photos (e.g. cars, glaciers, government buildings) from articles
+ * that merely mention the subject in passing.
  */
 export function isImageMatchingRules(
   imageUrl: string,
   rules: ReplacementRule[],
-  contextText: string = ''
+  imageSpecificMeta: string = ''
 ): boolean {
-  if (!rules || rules.length === 0) return false;
+  if (!rules || rules.length === 0 || !imageUrl) return false;
 
   const activeRules = rules.filter((r) => r.enabled && r.term && r.term.trim().length > 0);
   if (activeRules.length === 0) return false;
@@ -686,8 +755,6 @@ export function isImageMatchingRules(
     // ignore malformed URI
   }
 
-  const contextLower = (contextText || '').toLowerCase();
-
   const stopWords = new Set([
     'the', 'and', 'for', 'a', 'an', 'in', 'on', 'at', 'to', 'of', 'with', 'by',
     'jpg', 'png', 'jpeg', 'webp', 'gif', 'img', 'image', 'photo', 'news', 'live', 'media'
@@ -695,7 +762,6 @@ export function isImageMatchingRules(
 
   return activeRules.some((rule) => {
     const termClean = rule.term.trim().toLowerCase();
-    const repClean = (rule.replacement || '').trim().toLowerCase();
     if (!termClean) return false;
 
     // Helper: test for whole phrase or word boundary in text (including possessives and apostrophe variations)
@@ -716,77 +782,44 @@ export function isImageMatchingRules(
       }
     };
 
-    // 1. Check Context Text (Article title, description, link, or synthesized summary/details)
-    if (contextLower) {
-      // Check exact forbidden term (e.g. "elon musk")
-      if (containsPhraseOrWord(contextLower, termClean)) return true;
+    // 1. Check Image URL or decoded URL path / filename
+    const phraseVariations = [
+      termClean,
+      termClean.replace(/\s+/g, '-'),
+      termClean.replace(/\s+/g, '_'),
+      termClean.replace(/\s+/g, '+'),
+      termClean.replace(/\s+/g, '%20'),
+      termClean.replace(/\s+/g, ''),
+    ];
 
-      // Check replacement phrase if present (e.g. "a prominent tech mogul" or "tech mogul")
-      if (repClean && repClean.length >= 3 && containsPhraseOrWord(contextLower, repClean)) {
+    for (const varStr of phraseVariations) {
+      if (varStr.length >= 3 && (urlLower.includes(varStr) || decodedUrl.includes(varStr))) {
         return true;
       }
+    }
 
-      // Check significant words in term (e.g., "musk", "elon")
-      const termWords = termClean
-        .split(/\s+/)
-        .map((w) => w.replace(/[^\w]/g, ''))
-        .filter((w) => w.length >= 3 && !stopWords.has(w));
+    // Check individual significant words in the image URL (e.g. "trump" or "musk")
+    const termWords = termClean
+      .split(/\s+/)
+      .map((w) => w.replace(/[^\w]/g, ''))
+      .filter((w) => w.length >= 3 && !stopWords.has(w));
 
-      if (termWords.length > 0) {
-        for (const word of termWords) {
-          try {
-            const regex = new RegExp(`\\b${word}\\b`, 'i');
-            if (regex.test(contextLower)) return true;
-          } catch {
-            if (contextLower.includes(word)) return true;
-          }
+    for (const word of termWords) {
+      if (word.length >= 3) {
+        // Test word boundary in URL path/query (surrounded by -, _, /, ., or %20)
+        const urlWordRegex = new RegExp(`(?:[^a-z0-9]|^)${word}(?:[^a-z0-9]|$)`, 'i');
+        if (urlWordRegex.test(urlLower) || urlWordRegex.test(decodedUrl)) {
+          return true;
         }
       }
     }
 
-    // 2. Check Image URL or decoded URL
-    if (urlLower || decodedUrl) {
-      // Check term or term with URL separators
-      const phraseVariations = [
-        termClean,
-        termClean.replace(/\s+/g, '-'),
-        termClean.replace(/\s+/g, '_'),
-        termClean.replace(/\s+/g, '+'),
-        termClean.replace(/\s+/g, '%20'),
-        termClean.replace(/\s+/g, ''),
-      ];
-
-      for (const varStr of phraseVariations) {
-        if (varStr.length >= 2 && (urlLower.includes(varStr) || decodedUrl.includes(varStr))) {
-          return true;
-        }
-      }
-
-      // Check individual words in the image URL (e.g. "musk" or "elon" or "tesla")
-      const termWords = termClean
-        .split(/\s+/)
-        .map((w) => w.replace(/[^\w]/g, ''))
-        .filter((w) => w.length >= 3 && !stopWords.has(w));
-
+    // 2. Check explicit image-specific metadata (image alt attribute or image caption) if provided
+    if (imageSpecificMeta && imageSpecificMeta.trim().length > 0) {
+      const metaLower = imageSpecificMeta.toLowerCase();
+      if (containsPhraseOrWord(metaLower, termClean)) return true;
       for (const word of termWords) {
-        if (urlLower.includes(word) || decodedUrl.includes(word)) {
-          return true;
-        }
-      }
-
-      // Check replacement phrase in image URL
-      if (repClean && repClean.length >= 4) {
-        const repVariations = [
-          repClean,
-          repClean.replace(/\s+/g, '-'),
-          repClean.replace(/\s+/g, '_'),
-          repClean.replace(/\s+/g, ''),
-        ];
-        for (const repVar of repVariations) {
-          if (repVar.length >= 4 && (urlLower.includes(repVar) || decodedUrl.includes(repVar))) {
-            return true;
-          }
-        }
+        if (containsPhraseOrWord(metaLower, word)) return true;
       }
     }
 
@@ -1332,8 +1365,7 @@ export function synthesizeLocalFallback(
     const images: string[] = [];
     cluster.items.forEach(item => {
       item.images.forEach(img => {
-        const itemContext = `${item.title} ${item.description} ${item.link} ${cluster.representativeTitle}`;
-        if (!images.includes(img) && !isImageMatchingRules(img, rules, itemContext)) {
+        if (!images.includes(img) && !isGoogleNewsPlaceholder(img) && !isImageMatchingRules(img, rules)) {
           images.push(img);
         }
       });

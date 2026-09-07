@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { ChevronLeft, ChevronRight, Maximize2, X } from 'lucide-react';
 import { ReplacementRule } from '../types';
-import { isImageMatchingRules } from '../utils/rss';
+import { isImageMatchingRules, isGoogleNewsPlaceholder } from '../utils/rss';
 
 interface ImageCarouselProps {
   images: string[];
@@ -51,10 +51,9 @@ export const ImageCarousel: React.FC<ImageCarouselProps> = ({
   const [isChecking, setIsChecking] = useState<boolean>(true);
 
   useEffect(() => {
-    // Filter out any images matching active citation anonymizer rules using full context
-    const context = `${articleTitle || ''} ${articleSummary || ''}`;
+    // Filter out generic placeholders and any images matching active citation anonymizer rules
     const allowedImages = (images || []).filter(
-      (url) => !isImageMatchingRules(url, rules, context)
+      (url) => !isGoogleNewsPlaceholder(url) && !isImageMatchingRules(url, rules)
     );
 
     if (!showImages || allowedImages.length === 0) {
@@ -75,8 +74,8 @@ export const ImageCarousel: React.FC<ImageCarouselProps> = ({
             img.onload = () => {
               const w = img.naturalWidth;
               const h = img.naturalHeight;
-              // Reject obvious thumbnails, icons, and low-res images under 400x250 or under 100k total pixels
-              if (w >= 400 && h >= 250 && w * h >= 100000) {
+              // Reject obvious thumbnails, icons, and low-res images under 280x160 or under 50k total pixels
+              if (w >= 280 && h >= 160 && w * h >= 50000) {
                 const ratio = Math.round((w / h) * 100) / 100;
                 resolve({
                   url,

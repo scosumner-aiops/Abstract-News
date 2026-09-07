@@ -16,6 +16,7 @@
   ],
   "functions": {
     "api/index.ts": {
+      "includeFiles": ["dist/server.cjs", "firebase-applet-config.json"],
       "maxDuration": 60,
       "memory": 1024
     }

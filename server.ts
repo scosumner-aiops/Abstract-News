@@ -171,6 +171,7 @@ function getDb(): any {
 import {
   parseRssXml,
   extractImagesFromArticleHtml,
+  isGoogleNewsPlaceholder,
   synthesizeLocalFallback,
   applyReplacements,
   cleanCitationGrammarGlitches,
@@ -955,6 +956,9 @@ Respond ONLY with valid JSON:
     if (normName.includes('guardian') || normUrl.includes('theguardian.com')) {
       return [
         'https://www.theguardian.com/world/rss',
+        'https://www.theguardian.com/business/rss',
+        'https://www.theguardian.com/uk/rss',
+        'https://www.theguardian.com/international/rss',
         'https://news.google.com/rss/search?q=site:theguardian.com&hl=en-GB&gl=GB&ceid=GB:en'
       ];
     }
@@ -1218,99 +1222,271 @@ Return JSON with a "translations" array containing objects with "id", "title", a
     return items;
   }
 
+  async function resolveRealPublisherArticle(title: string, sourceName: string): Promise<{ url: string; images: string[] } | null> {
+    if (!title || !sourceName) return null;
+    const normSource = sourceName.toLowerCase();
+    let directFeeds: string[] = [];
+
+    if (normSource.includes('guardian')) {
+      directFeeds = [
+        'https://www.theguardian.com/business/rss',
+        'https://www.theguardian.com/world/rss',
+        'https://www.theguardian.com/uk/rss',
+        'https://www.theguardian.com/international/rss'
+      ];
+    } else if (normSource.includes('al jazeera') || normSource.includes('aljazeera')) {
+      directFeeds = ['https://www.aljazeera.com/xml/rss/all.xml'];
+    } else if (normSource.includes('independent')) {
+      directFeeds = ['https://www.independent.co.uk/news/rss', 'https://www.independent.co.uk/rss'];
+    } else if (normSource.includes('cbc')) {
+      directFeeds = ['https://www.cbc.ca/cmlink/rss-topstories', 'https://www.cbc.ca/cmlink/rss-canada'];
+    } else if (normSource.includes('la presse') || normSource.includes('lapresse')) {
+      directFeeds = ['https://www.lapresse.ca/actualites/rss', 'https://www.lapresse.ca/manchettes/rss'];
+    } else if (normSource.includes('global news')) {
+      directFeeds = ['https://globalnews.ca/feed/'];
+    }
+
+    for (const feedUrl of directFeeds) {
+      try {
+        const res = await fetch(feedUrl, {
+          headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AbstractNews/1.0 RSS Reader' },
+          signal: AbortSignal.timeout(4000)
+        });
+        if (!res.ok) continue;
+        const xml = await res.text();
+        const items = parseRssXml(xml, sourceName, feedUrl);
+
+        const titleWords = title.toLowerCase().replace(/[^\w\s]/g, '').split(/\s+/).filter(w => w.length > 3);
+        if (titleWords.length === 0) continue;
+
+        for (const item of items) {
+          const itemTitleNorm = item.title.toLowerCase().replace(/[^\w\s]/g, '');
+          const matches = titleWords.filter(w => itemTitleNorm.includes(w));
+          const matchRatio = matches.length / titleWords.length;
+
+          if (matchRatio >= 0.45) {
+            let imgs = (item.images || []).filter(img => !isGoogleNewsPlaceholder(img));
+            if (imgs.length === 0 && item.link && item.link.startsWith('http')) {
+              try {
+                const pageRes = await fetch(item.link, {
+                  headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
+                  signal: AbortSignal.timeout(4000)
+                });
+                if (pageRes.ok) {
+                  const html = await pageRes.text();
+                  imgs = extractImagesFromArticleHtml(html, item.link).filter(img => !isGoogleNewsPlaceholder(img));
+                }
+              } catch {}
+            }
+            return { url: item.link, images: imgs };
+          }
+        }
+      } catch {}
+    }
+
+    return null;
+  }
+
   // Helper for clicking through to original article URLs to scrape full article paragraphs and missing images
   async function enrichNewsItems(items: RawNewsItem[]): Promise<RawNewsItem[]> {
+    // Clean all items first: remove Google News placeholder images/logos
+    for (const item of items) {
+      item.images = (item.images || []).filter(img => !isGoogleNewsPlaceholder(img));
+    }
+
     const itemsToEnrich = items.filter(
       (i) => i.link && i.link.startsWith('http') && (
         stripHtml(i.description || '').length < 350 ||
         !i.images ||
-        i.images.length === 0
+        i.images.length === 0 ||
+        i.link.includes('news.google.com')
       )
     );
 
     if (itemsToEnrich.length === 0) return items;
 
-    await Promise.all(
-      itemsToEnrich.slice(0, 45).map(async (item) => {
-        try {
-          const res = await fetch(item.link, {
-            headers: {
-              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-              'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            },
-            signal: AbortSignal.timeout(4500),
-          });
-          if (!res.ok) return;
-          const html = await res.text();
-
-          // Extract images if item currently has no images
-          if (!item.images || item.images.length === 0) {
-            const articleImgs = extractImagesFromArticleHtml(html, item.link);
-            if (articleImgs.length > 0) {
-              item.images = articleImgs;
-            }
-          }
-
-          // Extract article body if description is short
-          if (stripHtml(item.description || '').length < 350) {
-            let cleanHtml = html
-              .replace(/<script[\s\S]*?<\/script>/gi, '')
-              .replace(/<style[\s\S]*?<\/style>/gi, '')
-              .replace(/<nav[\s\S]*?<\/nav>/gi, '')
-              .replace(/<header[\s\S]*?<\/header>/gi, '')
-              .replace(/<footer[\s\S]*?<\/footer>/gi, '')
-              .replace(/<aside[\s\S]*?<\/aside>/gi, '')
-              .replace(/<form[\s\S]*?<\/form>/gi, '');
-
-            const articleMatch =
-              cleanHtml.match(/<article[^>]*>([\s\S]*?)<\/article>/i) ||
-              cleanHtml.match(/<main[^>]*>([\s\S]*?)<\/main>/i) ||
-              cleanHtml.match(/<div[^>]*class=["'][^"']*(?:article|story|post|entry|content|body)[^"']*["'][^>]*>([\s\S]*?)<\/div>/i);
-            const container = articleMatch ? articleMatch[1] : cleanHtml;
-
-            const pMatches = container.match(/<p[^>]*>([\s\S]*?)<\/p>/gi) || [];
-            const extracted: string[] = [];
-
-            for (const pXml of pMatches) {
-              const cleanP = stripHtml(pXml).trim();
-              if (
-                cleanP.length > 30 &&
-                !isJunkOrMetadataParagraph(cleanP) &&
-                !cleanP.toLowerCase().includes('cookie') &&
-                !cleanP.toLowerCase().includes('all rights reserved') &&
-                !cleanP.toLowerCase().includes('privacy policy') &&
-                !cleanP.toLowerCase().includes('subscribe') &&
-                !cleanP.toLowerCase().includes('copyright') &&
-                !cleanP.toLowerCase().includes('sign up for')
-              ) {
-                extracted.push(cleanP);
-              }
-            }
-
-            if (extracted.length > 0) {
-              const fullBody = extracted.join('\n\n');
-              const truncatedBody = fullBody.substring(0, 10000);
-              if (truncatedBody.length > (item.description || '').length) {
-                item.description = truncatedBody;
-              }
-            } else {
-              const metaOgMatch =
-                html.match(/<meta[^>]+property=["']og:description["'][^>]+content=["']([^"']+)["']/i) ||
-                html.match(/<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:description["']/i) ||
-                html.match(/<meta[^>]+name=["']description["'][^>]+content=["']([^"']+)["']/i);
-              if (metaOgMatch && metaOgMatch[1]) {
-                const metaDesc = stripHtml(metaOgMatch[1]).trim().substring(0, 10000);
-                if (metaDesc.length > (item.description || '').length) {
-                  item.description = metaDesc;
+    // Process up to 100 items in parallel chunks of 25 to avoid timing out
+    const chunkSize = 25;
+    const candidates = itemsToEnrich.slice(0, 100);
+    for (let c = 0; c < candidates.length; c += chunkSize) {
+      const chunk = candidates.slice(c, c + chunkSize);
+      await Promise.all(
+        chunk.map(async (item) => {
+          try {
+            // If item has a Google News link or no images, try resolving direct publisher link first
+            if (item.link.includes('news.google.com') || !item.images || item.images.length === 0) {
+              const resolved = await resolveRealPublisherArticle(item.title, item.sourceName);
+              if (resolved && resolved.url) {
+                item.link = resolved.url;
+                if (resolved.images && resolved.images.length > 0) {
+                  item.images = resolved.images;
                 }
               }
             }
-          }
-        } catch {}
-      })
-    );
+
+            // Now fetch original article page if link is a direct publisher URL
+            if (item.link && !item.link.includes('news.google.com')) {
+              const res = await fetch(item.link, {
+                headers: {
+                  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                },
+                signal: AbortSignal.timeout(4500),
+              });
+              if (res.ok) {
+                const html = await res.text();
+
+                // Extract images if item currently has no images
+                if (!item.images || item.images.length === 0) {
+                  const articleImgs = extractImagesFromArticleHtml(html, item.link).filter(img => !isGoogleNewsPlaceholder(img));
+                  if (articleImgs.length > 0) {
+                    item.images = articleImgs;
+                  }
+                }
+
+                // Extract article body if description is short
+                if (stripHtml(item.description || '').length < 350) {
+                  let cleanHtml = html
+                    .replace(/<script[\s\S]*?<\/script>/gi, '')
+                    .replace(/<style[\s\S]*?<\/style>/gi, '')
+                    .replace(/<nav[\s\S]*?<\/nav>/gi, '')
+                    .replace(/<header[\s\S]*?<\/header>/gi, '')
+                    .replace(/<footer[\s\S]*?<\/footer>/gi, '')
+                    .replace(/<aside[\s\S]*?<\/aside>/gi, '')
+                    .replace(/<form[\s\S]*?<\/form>/gi, '');
+
+                  const articleMatch =
+                    cleanHtml.match(/<article[^>]*>([\s\S]*?)<\/article>/i) ||
+                    cleanHtml.match(/<main[^>]*>([\s\S]*?)<\/main>/i) ||
+                    cleanHtml.match(/<div[^>]*class=["'][^"']*(?:article|story|post|entry|content|body)[^"']*["'][^>]*>([\s\S]*?)<\/div>/i);
+                  const container = articleMatch ? articleMatch[1] : cleanHtml;
+
+                  const pMatches = container.match(/<p[^>]*>([\s\S]*?)<\/p>/gi) || [];
+                  const extracted: string[] = [];
+
+                  for (const pXml of pMatches) {
+                    const cleanP = stripHtml(pXml).trim();
+                    if (
+                      cleanP.length > 30 &&
+                      !isJunkOrMetadataParagraph(cleanP) &&
+                      !cleanP.toLowerCase().includes('cookie') &&
+                      !cleanP.toLowerCase().includes('all rights reserved') &&
+                      !cleanP.toLowerCase().includes('privacy policy') &&
+                      !cleanP.toLowerCase().includes('subscribe') &&
+                      !cleanP.toLowerCase().includes('copyright') &&
+                      !cleanP.toLowerCase().includes('sign up for')
+                    ) {
+                      extracted.push(cleanP);
+                    }
+                  }
+
+                  if (extracted.length > 0) {
+                    const fullBody = extracted.join('\n\n');
+                    const truncatedBody = fullBody.substring(0, 10000);
+                    if (truncatedBody.length > (item.description || '').length) {
+                      item.description = truncatedBody;
+                    }
+                  } else {
+                    const metaOgMatch =
+                      html.match(/<meta[^>]+property=["']og:description["'][^>]+content=["']([^"']+)["']/i) ||
+                      html.match(/<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:description["']/i) ||
+                      html.match(/<meta[^>]+name=["']description["'][^>]+content=["']([^"']+)["']/i);
+                    if (metaOgMatch && metaOgMatch[1]) {
+                      const metaDesc = stripHtml(metaOgMatch[1]).trim().substring(0, 10000);
+                      if (metaDesc.length > (item.description || '').length) {
+                        item.description = metaDesc;
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          } catch {}
+        })
+      );
+    }
 
     return items;
+  }
+
+  // Fallback search mechanism to ensure every synthesized article gets a high-resolution news photo
+  async function fetchFallbackImagesForArticleTitle(title: string, rules: ReplacementRule[]): Promise<string[]> {
+    if (!title || title.trim().length < 5) return [];
+    try {
+      const cleanSearchQuery = title.replace(/['"’]/g, '').trim();
+      const searchUrl = `https://news.google.com/rss/search?q=${encodeURIComponent(cleanSearchQuery)}&hl=en-US&gl=US&ceid=US:en`;
+      const res = await fetch(searchUrl, {
+        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AbstractNews/1.0 RSS Reader' },
+        signal: AbortSignal.timeout(4000),
+      });
+      if (!res.ok) return [];
+      const xml = await res.text();
+      const itemMatches = Array.from(xml.matchAll(/<item>([\s\S]*?)<\/item>/gi));
+      for (const itemXml of itemMatches.slice(0, 3)) {
+        const linkMatch = itemXml[0].match(/<link>([^<]+)<\/link>/i);
+        if (linkMatch) {
+          const itemLink = linkMatch[1].replace(/&amp;/g, '&').trim();
+          const artRes = await fetch(itemLink, {
+            headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36' },
+            signal: AbortSignal.timeout(4000),
+          });
+          if (artRes.ok) {
+            const html = await artRes.text();
+            const extracted = extractImagesFromArticleHtml(html, itemLink);
+            const clean = extracted.filter(img => !isGoogleNewsPlaceholder(img) && !isImageMatchingRules(img, rules));
+            if (clean.length > 0) return clean;
+          }
+        }
+      }
+    } catch {}
+    return [];
+  }
+
+  async function ensureImagesForArticles(articles: SynthesizedArticle[], rules: ReplacementRule[]): Promise<SynthesizedArticle[]> {
+    await Promise.all(
+      articles.map(async (art) => {
+        art.images = (art.images || []).filter(img => !isGoogleNewsPlaceholder(img) && !isImageMatchingRules(img, rules));
+
+        // 1. Scrape lead images across all direct publisher sources if article has multiple feeds and few images
+        if (art.images.length < 3 && art.sourceLinks && art.sourceLinks.length > 0) {
+          const directLinks = art.sourceLinks
+            .map(l => l.url)
+            .filter(u => u && !u.includes('news.google.com') && u.startsWith('http'));
+
+          await Promise.all(
+            directLinks.slice(0, 5).map(async (linkUrl) => {
+              try {
+                const pageRes = await fetch(linkUrl, {
+                  headers: {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                  },
+                  signal: AbortSignal.timeout(4000),
+                });
+                if (pageRes.ok) {
+                  const html = await pageRes.text();
+                  const scraped = extractImagesFromArticleHtml(html, linkUrl);
+                  scraped.forEach((img) => {
+                    if (!art.images.includes(img) && !isGoogleNewsPlaceholder(img) && !isImageMatchingRules(img, rules)) {
+                      art.images.push(img);
+                    }
+                  });
+                }
+              } catch {}
+            })
+          );
+        }
+
+        // 2. If article still has zero images, search via news headline query
+        if (!art.images || art.images.length === 0) {
+          const fallbackImgs = await fetchFallbackImagesForArticleTitle(art.title, rules);
+          if (fallbackImgs.length > 0) {
+            art.images = fallbackImgs.filter(img => !isGoogleNewsPlaceholder(img) && !isImageMatchingRules(img, rules));
+          }
+        }
+      })
+    );
+    return articles;
   }
 
   // 2. RSS Fetch Proxy API Endpoint
@@ -1543,13 +1719,12 @@ ${seeLessTopics.map(t => `  * "${t}": De-emphasize and downweight coverage on th
                 const matchedIds: number[] = art.matchedItemIds || [];
                 const matchedItems = matchedIds.map(id => sortedItems[id]).filter(Boolean);
 
-                // Gather images from matched items, excluding those matching forbidden citation replacement rules
+                // Gather images from matched items, excluding those matching forbidden citation replacement rules or generic logos
                 const images: string[] = [];
                 matchedItems.forEach(item => {
                   if (item.images && Array.isArray(item.images)) {
                     item.images.forEach(img => {
-                      const itemContext = `${item.title} ${item.description} ${item.link} ${art.title || ''} ${art.summary || ''} ${art.fullDetails || ''}`;
-                      if (!images.includes(img) && !isImageMatchingRules(img, rules, itemContext)) {
+                      if (!images.includes(img) && !isGoogleNewsPlaceholder(img) && !isImageMatchingRules(img, rules)) {
                         images.push(img);
                       }
                     });
@@ -1645,6 +1820,9 @@ ${seeLessTopics.map(t => `  * "${t}": De-emphasize and downweight coverage on th
                 return scoreB - scoreA;
               });
 
+              // Ensure every article has lead imagery via fallback fetch if missing
+              await ensureImagesForArticles(deduplicatedArticles, rules);
+
               // Filter article images with Gemini Vision against active rules
               const cleanArticles = await filterArticleImagesWithVision(deduplicatedArticles, rules, ai);
 
@@ -1665,6 +1843,7 @@ ${seeLessTopics.map(t => `  * "${t}": De-emphasize and downweight coverage on th
 
       // Fallback local engine
       const fallbackArticles = synthesizeLocalFallback(items, rules, timeframeHours, primarySourceName, topics);
+      await ensureImagesForArticles(fallbackArticles, rules);
       const cleanFallbackArticles = await filterArticleImagesWithVision(fallbackArticles, rules, ai);
       res.json({
         articles: cleanFallbackArticles,
