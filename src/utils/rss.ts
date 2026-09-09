@@ -506,11 +506,212 @@ export function cleanCitationGrammarGlitches(text: string): string {
 }
 
 /**
- * Formats text into a concise, punchy 1-2 sentence summary (max ~280 chars)
+ * Strips editorial newsletter, live blog, or briefing prefixes from titles
+ * (e.g. "Bulletin world briefing: Two killed...", "Live updates: Parliament...", "Morning briefing: ")
  */
-export function formatConciseSummary(str: string): string {
+export function stripEditorialPrefixes(title: string): string {
+  if (!title) return '';
+  let cleaned = title.trim();
+
+  // Strip prefixes like "Bulletin world briefing: ", "World briefing: ", "Morning briefing: ", etc.
+  cleaned = cleaned.replace(
+    /^(?:bulletin\s+world\s+briefing|world\s+briefing|morning\s+briefing|evening\s+briefing|daily\s+briefing|news\s+briefing|briefing|live\s+updates|live\s+coverage|live\s+blog|live|watch\s+live|watch|video|podcast|audio|special\s+report|breaking\s+news|breaking|news\s+alert|analysis|explainer|fact\s+check|in\s+pictures|photos?|exclusive|interview|editorial|opinion)\s*:\s*/i,
+    ''
+  );
+
+  // Strip leading bracket/parenthetical tags
+  cleaned = cleaned.replace(/^\[(?:live|update|breaking|video|audio|photos?|briefing)\]\s*/i, '');
+  cleaned = cleaned.replace(/^\((?:live|update|breaking|video|audio|photos?|briefing)\)\s*/i, '');
+
+  return cleaned.trim();
+}
+
+/**
+ * Strips trailing publisher attribution branding from sentences or paragraphs
+ * (e.g. "...targets oil terminal France 24", "...reported on Wednesday - Reuters")
+ */
+export function stripTrailingPublisherAttribution(text: string): string {
+  if (!text) return '';
+  let cleaned = text.trim();
+  cleaned = cleaned.replace(
+    /\s*(?:[-–—|•·]|\s)\s*(?:France\s*24|Reuters(?:\.com)?|Deutsche\s+Welle|DW(?:\.com)?|Global\s+News(?:\s+Canada)?|The\s+Guardian|The\s+Independent|Associated\s+Press|AP\s+News|CBC(?:\s+News)?|National\s+Post|La\s+Presse|Globo|G1|BBC(?:\s+News)?|CNN|Bloomberg|Financial\s+Times|Toronto\s+Star|CP24|CTV(?:\s+News)?)\.?\s*$/i,
+    '.'
+  );
+  cleaned = cleaned.replace(/\.{2,}$/, '.');
+  return cleaned.trim();
+}
+
+/**
+ * Strips orphaned contrastive or transitional conjunctions that make no sense without preceding text
+ * (e.g. "However, Vucic plans to stand as a PM candidate." -> "Vucic plans to stand as a PM candidate.")
+ */
+export function cleanOrphanedConjunctions(text: string): string {
+  if (!text) return '';
+  let cleaned = text.trim();
+  cleaned = cleaned.replace(
+    /^(?:However|Moreover|Furthermore|Therefore|Meanwhile|Additionally|Nevertheless|In addition|Instead|Consequently|Also|On the other hand|At the same time|In the meantime),?\s+/i,
+    ''
+  );
+  if (cleaned.length > 0) {
+    cleaned = cleaned.charAt(0).toUpperCase() + cleaned.slice(1);
+  }
+  return cleaned;
+}
+
+/**
+ * Strips publisher suffix branding from titles (e.g. " - Montreal Gazette", " - Global News", " | Al Jazeera", " - AP News")
+ */
+export function stripPublisherSuffix(title: string): string {
+  if (!title) return '';
+  let cleaned = stripEditorialPrefixes(title.trim());
+
+  // 1. Strip domain/URL-like suffixes after a separator (e.g. ' - DW.Com', ' - reuters.Com', ' - globalnews.Ca', ' - theguardian.com')
+  cleaned = cleaned.replace(/\s*[-–—|•·]\s*[A-Za-z0-9\s.-]+?\.(?:com|ca|org|net|co\.uk|de|fr|io|br|gov|edu|it|es|pt|ch|at|au|nz)\s*$/i, '');
+
+  // 2. Strip known publisher names with or without domain extensions
+  cleaned = cleaned.replace(/\s*[-–—|•·]\s*(?:Montreal\s+Gazette|Global\s+News(?:\s+Canada)?|Global\s*Player|Al\s*Jazeera(?:\s+English)?|Associated\s+Press|AP\s+News|Reuters(?:\.com)?|CBC(?:\s+News)?(?:\.ca)?|National\s+Post|La\s+Presse|The\s+Guardian|The\s+Independent|Deutsche\s+Welle|DW(?:\.com)?|France\s+24|Globo(?:\s+\(G1\))?|G1|BBC(?:\s+News)?|CNN|The\s+Washington\s+Post|The\s+New\s+York\s+Times|Bloomberg|Financial\s+Times|CityNews|Toronto\s+Star|Financial\s+Post|CP24|CTV(?:\s+News)?|Edmonton\s+Journal|Calgary\s+Herald|Ottawa\s+Citizen)\s*$/i, '');
+
+  // 3. Strip general separator followed by publisher or domain-like string
+  cleaned = cleaned.replace(/\s*[-–—|•·]\s*[A-Za-z0-9\s.-]{2,35}\s*$/i, (match) => {
+    const candidate = match.replace(/^[\s\-–—|•·]+/, '').trim();
+    const lower = candidate.toLowerCase();
+    const known = [
+      'gazette', 'global news', 'globalnews', 'al jazeera', 'ap news', 'ap', 'reuters', 'cbc',
+      'national post', 'la presse', 'guardian', 'independent', 'dw', 'france 24',
+      'globo', 'g1', 'bbc', 'cnn', 'citynews', 'toronto star', 'financial post',
+      'cp24', 'ctv', 'edmonton journal', 'calgary herald', 'ottawa citizen'
+    ];
+    if (known.some(p => lower.includes(p)) || /\.[a-z]{2,4}$/i.test(lower)) {
+      return '';
+    }
+    return match;
+  });
+
+  // 4. Strip stray domain suffixes at the very end of string even without separator (e.g., 'Syria arms depot DW.Com')
+  cleaned = cleaned.replace(/\s+(?:DW|Reuters|Globalnews|CBC|BBC|TheGuardian)\.(?:com|ca|org|net|de|fr|co\.uk)\s*$/i, '');
+
+  return stripEditorialPrefixes(cleaned.trim());
+}
+
+/**
+ * Detects placeholder, audio stream, video player, or navigation feed items that are not actual news articles
+ */
+export function isJunkOrPlaceholderItem(title: string, description: string = '', sourceName: string = ''): boolean {
+  const t = (title || '').trim().toLowerCase();
+  const d = (description || '').trim().toLowerCase();
+  const s = (sourceName || '').trim().toLowerCase();
+
+  const cleanT = stripPublisherSuffix(stripEditorialPrefixes(title)).trim().toLowerCase();
+
+  const junkTitles = [
+    'global player',
+    'global news',
+    'player',
+    'live player',
+    'audio player',
+    'video player',
+    'news - al jazeera',
+    'al jazeera english',
+    'al jazeera',
+    'cbc news',
+    'la presse',
+    'national post',
+    'the guardian',
+    'the independent',
+    'reuters',
+    'associated press',
+    'dw',
+    'deutsche welle',
+    'france 24',
+    'globo',
+    'g1',
+    'headlines',
+    'top stories',
+    'latest news',
+    'watch live',
+    'listen live',
+    'live stream',
+    'live radio',
+    'broadcast schedule',
+    'weather forecast',
+    'todays horoscope',
+    'horoscope',
+    'lottery results',
+    'contact us',
+    'terms of service',
+    'privacy policy',
+  ];
+
+  if (junkTitles.includes(cleanT) || junkTitles.includes(t)) return true;
+  if (cleanT.includes('global player') || t.includes('global player')) return true;
+  if (cleanT === 'player' || t === 'player') return true;
+  if (s && (cleanT === s || t === s)) return true;
+
+  if (
+    cleanT.startsWith('global news hour at 6') ||
+    cleanT.startsWith('global news at 5') ||
+    cleanT.startsWith('global news at 11') ||
+    cleanT.startsWith('global news morning') ||
+    cleanT.startsWith('podcast:') ||
+    cleanT.startsWith('the daily:') ||
+    cleanT.startsWith('radio broadcast')
+  ) {
+    return true;
+  }
+
+  // Pure newsletter teasers without real article content
+  if (
+    /here\s+are\s+\w+\s+stories\s+from\s+across\s+the\s+globe/i.test(d) ||
+    /here\s+(?:is|are)\s+(?:five|ten|\d+|some|the)\s+stories/i.test(d)
+  ) {
+    if (cleanT.length < 25) return true;
+  }
+
+  const titleWords = cleanT.split(/\s+/).filter(w => w.length > 1);
+  if (titleWords.length < 3 && (!d || d === t || d === cleanT || d.length < 25)) {
+    return true;
+  }
+
+  if (cleanT.length < 15 && (!d || d.length < 25)) {
+    return true;
+  }
+
+  if ((t === d || cleanT === d) && cleanT.length < 35) {
+    return true;
+  }
+
+  if (cleanT.length < 12 && !cleanT.includes(' ')) {
+    return true;
+  }
+
+  return false;
+}
+
+/**
+ * Formats text into a concise, punchy 1-2 sentence summary (max ~280 chars)
+ * Ensures summary NEVER duplicates the headline.
+ */
+export function formatConciseSummary(str: string, titleToDeduplicate?: string): string {
   if (!str) return '';
-  const clean = cleanCitationGrammarGlitches(cleanLiveblogAndRoundupArtifacts(stripHtml(str).replace(/\n+/g, ' ').replace(/\s+/g, ' ').trim()));
+  let clean = stripTrailingPublisherAttribution(
+    stripPublisherSuffix(cleanCitationGrammarGlitches(cleanLiveblogAndRoundupArtifacts(stripHtml(str).replace(/\n+/g, ' ').replace(/\s+/g, ' ').trim())))
+  );
+  if (!clean) return '';
+
+  // Reject newsletter teasers and clickbait briefing headers as summaries
+  if (isJunkOrMetadataParagraph(clean)) return '';
+
+  if (titleToDeduplicate) {
+    const cleanTitle = stripPublisherSuffix(stripEditorialPrefixes(titleToDeduplicate)).trim().toLowerCase();
+    const cleanLower = clean.toLowerCase();
+    if (cleanLower === cleanTitle || calculateJaccardSimilarity(clean, titleToDeduplicate) >= 0.75) {
+      return '';
+    }
+    if (cleanLower.startsWith(cleanTitle)) {
+      clean = clean.slice(cleanTitle.length).replace(/^[\s\-–—:;]+/, '').trim();
+    }
+  }
+
   if (!clean) return '';
 
   let summary = clean;
@@ -518,7 +719,10 @@ export function formatConciseSummary(str: string): string {
   if (sentences && sentences.length > 0) {
     let result = '';
     for (let i = 0; i < Math.min(sentences.length, 2); i++) {
-      const nextSentence = sentences[i];
+      let nextSentence = cleanOrphanedConjunctions(sentences[i].trim());
+      if (titleToDeduplicate && areSentencesSemanticallyDuplicate(nextSentence, titleToDeduplicate)) {
+        continue;
+      }
       if ((result + ' ' + nextSentence).trim().length > 280 && i >= 1) {
         break;
       }
@@ -529,6 +733,13 @@ export function formatConciseSummary(str: string): string {
     const sub = clean.substring(0, 275);
     const lastSpace = sub.lastIndexOf(' ');
     summary = (lastSpace > 120 ? sub.substring(0, lastSpace) : sub) + '...';
+  }
+
+  summary = cleanOrphanedConjunctions(summary);
+  summary = stripTrailingPublisherAttribution(summary);
+
+  if (titleToDeduplicate && (areSentencesSemanticallyDuplicate(summary, titleToDeduplicate) || calculateJaccardSimilarity(summary, titleToDeduplicate) >= 0.75)) {
+    return '';
   }
 
   return cleanCitationGrammarGlitches(fixSentenceStartCapitalization(summary));
@@ -627,6 +838,10 @@ export function parseRssXml(xmlText: string, sourceName: string, sourceUrl: stri
 
     const title = stripHtml(titleRaw);
     const description = stripHtml(descRaw);
+
+    // Skip audio players, station identity stubs, schedules, and junk navigation placeholders
+    if (isJunkOrPlaceholderItem(title, description, sourceName)) return;
+
     const link = linkRaw.replace(/<[^>]+>/g, '').trim() || sourceUrl;
     
     let pubDate = new Date();
@@ -942,8 +1157,53 @@ const TOPIC_STOP_WORDS = new Set([
   'million', 'billion', 'call', 'talks', 'top', 'lead', 'leads', 'war', 'attack', 'us', 'uk', 'eu',
   'boxing', 'athletics', 'relay', 'swimming', 'final', 'finals', 'games', 'gold', 'silver', 'bronze',
   'medal', 'medals', 'event', 'match', 'race', 'team', 'teams', 'cup', 'win', 'wins', 'won', 'title',
-  'stole', 'show', 'mop', 'man', 'men', 'women', 'womens', 'mens', 'round', 'stage'
+  'stole', 'show', 'mop', 'man', 'men', 'women', 'womens', 'mens', 'round', 'stage',
+  // Media source branding and common broadcast tags to avoid false clustering
+  'montreal', 'gazette', 'global', 'aljazeera', 'jazeera', 'cbc', 'bbc', 'reuters', 'guardian',
+  'independent', 'lapresse', 'presse', 'nationalpost', 'post', 'herald', 'journal', 'citizen',
+  'canada', 'canadian', 'american', 'daily', 'times', 'radio', 'video', 'player', 'hour',
+  'morning', 'evening', 'night', 'edition', 'liveblog', 'roundup', 'feed'
 ]);
+
+/**
+ * Checks if two sentences describe the exact same factual event using semantic keyword overlap
+ */
+export function areSentencesSemanticallyDuplicate(s1: string, s2: string): boolean {
+  if (!s1 || !s2) return false;
+  const t1 = s1.trim().toLowerCase();
+  const t2 = s2.trim().toLowerCase();
+  if (t1 === t2) return true;
+  if (t1.length >= 25 && t2.includes(t1) && t1.length >= t2.length * 0.8) return true;
+  if (t2.length >= 25 && t1.includes(t2) && t2.length >= t1.length * 0.8) return true;
+
+  const getKeywords = (txt: string) => {
+    return new Set(
+      txt
+        .toLowerCase()
+        .replace(/[^\w\s]/g, ' ')
+        .split(/\s+/)
+        .filter(w => w.length >= 4 && !TOPIC_STOP_WORDS.has(w))
+    );
+  };
+
+  const kw1 = getKeywords(s1);
+  const kw2 = getKeywords(s2);
+
+  if (kw1.size === 0 || kw2.size === 0) return false;
+
+  let shared = 0;
+  kw1.forEach(w => {
+    if (kw2.has(w)) shared++;
+  });
+
+  const overlap1 = shared / kw1.size;
+  const overlap2 = shared / kw2.size;
+  const minOverlap = Math.min(overlap1, overlap2);
+  const maxOverlap = Math.max(overlap1, overlap2);
+
+  // Require bidirectional substantial overlap to prevent a short 2-word topic mention from erasing a rich, informative sentence
+  return (minOverlap >= 0.55 && maxOverlap >= 0.70) || (overlap1 >= 0.70 && overlap2 >= 0.70);
+}
 
 /**
  * Jaccard text similarity calculation for topic clustering
@@ -981,22 +1241,24 @@ export function areArticlesAboutSameTopic(
   title2: string,
   desc2: string
 ): boolean {
-  const t1 = title1.toLowerCase().trim();
-  const t2 = title2.toLowerCase().trim();
+  const cleanT1 = stripPublisherSuffix(title1).toLowerCase().trim();
+  const cleanT2 = stripPublisherSuffix(title2).toLowerCase().trim();
+
+  if (cleanT1.length < 15 || cleanT2.length < 15) return false;
 
   // 1. High Title Jaccard Similarity (Direct title match / rewrites)
-  const titleJaccard = calculateJaccardSimilarity(t1, t2);
-  if (titleJaccard >= 0.50) {
+  const titleJaccard = calculateJaccardSimilarity(cleanT1, cleanT2);
+  if (titleJaccard >= 0.45) {
     return true;
   }
 
   const getTitleKeywords = (txt: string) => {
     const clean = txt.replace(/[^\w\s]/g, ' ');
-    return new Set(clean.split(/\s+/).filter(w => w.length >= 3 && !TOPIC_STOP_WORDS.has(w)));
+    return new Set(clean.split(/\s+/).filter(w => w.length >= 4 && !TOPIC_STOP_WORDS.has(w)));
   };
 
-  const kw1 = getTitleKeywords(t1);
-  const kw2 = getTitleKeywords(t2);
+  const kw1 = getTitleKeywords(cleanT1);
+  const kw2 = getTitleKeywords(cleanT2);
 
   // Count shared specific title keywords
   const sharedTitleKw: string[] = [];
@@ -1004,8 +1266,13 @@ export function areArticlesAboutSameTopic(
     if (kw2.has(w)) sharedTitleKw.push(w);
   });
 
-  // Require at least 3 distinct specific non-generic keywords directly in the TITLES or 2 long keywords (>= 6 chars)
-  if (sharedTitleKw.length >= 3 || (sharedTitleKw.length === 2 && sharedTitleKw.every(w => w.length >= 6))) {
+  // Require at least 3 distinct specific non-generic keywords directly in the TITLES AND reasonable Jaccard similarity (>= 0.30)
+  if (sharedTitleKw.length >= 3 && titleJaccard >= 0.30) {
+    return true;
+  }
+
+  // If 4 or more distinct specific keywords match (e.g. "churchill falls deal hydro newfoundland")
+  if (sharedTitleKw.length >= 4) {
     return true;
   }
 
@@ -1025,11 +1292,15 @@ export function mergeDuplicateSynthesizedArticles(articles: SynthesizedArticle[]
 
     for (let i = 0; i < merged.length; i++) {
       const existing = merged[i];
+      const cleanExisting = stripPublisherSuffix(existing.title);
+      const cleanArt = stripPublisherSuffix(art.title);
+      // Synthesized stories should only be merged if their titles are direct rewrites of the same event
       if (
+        calculateJaccardSimilarity(cleanExisting, cleanArt) >= 0.50 ||
         areArticlesAboutSameTopic(
-          existing.title,
+          cleanExisting,
           existing.summary.slice(0, 120),
-          art.title,
+          cleanArt,
           art.summary.slice(0, 120)
         )
       ) {
@@ -1230,6 +1501,20 @@ export function isJunkOrMetadataParagraph(text: string): boolean {
     return true;
   }
 
+  // 9. Newsletter roundup teasers and briefing clickbait phrases
+  if (
+    /here\s+are\s+\w+\s+stories\s+from\s+across\s+the\s+globe/i.test(trimmed) ||
+    /here\s+(?:is|are)\s+(?:five|ten|\d+|some|the)\s+stories/i.test(trimmed) ||
+    /here(?:'s|\s+is)\s+what\s+you\s+(?:need\s+to\s+know|may\s+have\s+missed)/i.test(trimmed) ||
+    /(?:top\s+stories|stories)\s+you\s+may\s+have\s+missed/i.test(trimmed) ||
+    /catch\s+up\s+on\s+the\s+latest/i.test(trimmed) ||
+    /your\s+(?:daily|morning|evening|weekend)\s+briefing/i.test(trimmed) ||
+    /sign\s+up\s+(?:here\s+)?to\s+get/i.test(trimmed) ||
+    /read\s+the\s+full\s+(?:newsletter|briefing)/i.test(trimmed)
+  ) {
+    return true;
+  }
+
   return false;
 }
 
@@ -1248,15 +1533,19 @@ export function sanitizeArticleDetailsParagraphs(
   // Helper to normalize text to alpha-numeric lower for fuzzy substring containment
   const normAlpha = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, '');
 
-  const alphaTitle = normAlpha(stripHtml(title));
-  const alphaSummary = normAlpha(stripHtml(summary));
+  const cleanTitle = stripPublisherSuffix(stripEditorialPrefixes(title)).trim();
+  const cleanSummary = stripTrailingPublisherAttribution(stripPublisherSuffix(summary)).trim();
+  const alphaTitle = normAlpha(stripHtml(cleanTitle));
+  const alphaSummary = normAlpha(stripHtml(cleanSummary));
+
+  const summarySentences = splitIntoSentences(cleanSummary);
+  const allAcceptedSentences: string[] = [];
 
   const result: string[] = [];
   let totalWords = 0;
 
   for (const rawP of rawParagraphs) {
     if (isRoundupOrSideStoryHeader(rawP)) {
-      // Stop processing any subsequent paragraphs for this article as they belong to off-topic weekly roundups
       break;
     }
 
@@ -1273,30 +1562,24 @@ export function sanitizeArticleDetailsParagraphs(
     const alphaP = normAlpha(p);
     if (alphaP.length < 15) continue;
 
-    // Duplication checks using alpha-numeric substring matching:
-    // 1. If summary or title contains this entire paragraph (or a 20+ char slice of it)
-    if (alphaSummary && alphaSummary.length >= alphaP.length && alphaSummary.includes(alphaP)) continue;
-    if (alphaSummary && alphaP.length > 20 && alphaSummary.includes(alphaP.slice(0, 20))) continue;
-    if (alphaSummary && alphaP.length > 30 && alphaSummary.includes(alphaP.slice(10, 35))) continue;
+    // Drop only if the ENTIRE paragraph is purely the title or summary
+    if (alphaTitle && alphaP === alphaTitle) continue;
+    if (alphaSummary && alphaP === alphaSummary) continue;
+    if (calculateJaccardSimilarity(p, cleanTitle) >= 0.75) continue;
+    if (calculateJaccardSimilarity(p, cleanSummary) >= 0.75) continue;
 
-    if (alphaTitle && alphaTitle.length >= alphaP.length && alphaTitle.includes(alphaP)) continue;
-    if (alphaTitle && alphaP.length > 20 && alphaTitle.includes(alphaP.slice(0, 20))) continue;
-
-    // 2. If this paragraph contains the summary or title
-    if (alphaSummary && alphaP.length >= alphaSummary.length && alphaP.includes(alphaSummary)) continue;
-
-    // 3. Duplication check against previously added paragraphs in result (no repeated topics)
+    // Check if entire paragraph repeats an already accepted paragraph
     const isTopicRepeat = result.some(prevP => {
+      if (calculateJaccardSimilarity(prevP, p) >= 0.70) return true;
       const alphaPrev = normAlpha(prevP);
       if (alphaPrev.length >= 30 && alphaP.length >= 30) {
-        if (alphaPrev.includes(alphaP) || alphaP.includes(alphaPrev)) return true;
-        if (alphaPrev.slice(0, 35) === alphaP.slice(0, 35)) return true;
+        if (alphaPrev.slice(0, 40) === alphaP.slice(0, 40)) return true;
       }
       return false;
     });
     if (isTopicRepeat) continue;
 
-    // 4. Sentence level duplication check
+    // Sentence level semantic duplication check: strips only duplicate sentences while preserving the rest of the informative paragraph
     const pSentences = splitIntoSentences(p);
     const nonDupSentences: string[] = [];
 
@@ -1307,23 +1590,36 @@ export function sanitizeArticleDetailsParagraphs(
       if (alphaSent.length < 15) continue;
       if (isJunkOrMetadataParagraph(sent)) continue;
 
-      if (alphaSummary && alphaSummary.includes(alphaSent)) continue;
-      if (alphaSummary && alphaSent.length > 20 && alphaSummary.includes(alphaSent.slice(0, 20))) continue;
-      if (alphaTitle && alphaTitle.includes(alphaSent)) continue;
+      if (alphaSummary && (alphaSent === alphaSummary || calculateJaccardSimilarity(sent, cleanSummary) >= 0.75)) continue;
+      if (alphaTitle && (alphaSent === alphaTitle || calculateJaccardSimilarity(sent, cleanTitle) >= 0.75)) continue;
 
-      // Ensure this sentence wasn't already included in earlier paragraphs
-      const sentRepeatedInResult = result.some(prevP => {
-        const alphaPrev = normAlpha(prevP);
-        return alphaPrev.includes(alphaSent) || (alphaSent.length > 25 && alphaPrev.includes(alphaSent.slice(0, 25)));
-      });
+      // Check semantic duplication against summary
+      const isDupOfSummary = areSentencesSemanticallyDuplicate(cleanSummary, sent) ||
+        summarySentences.some(sSent => areSentencesSemanticallyDuplicate(sSent, sent));
+      if (isDupOfSummary) continue;
+
+      // Check semantic duplication against headline
+      if (areSentencesSemanticallyDuplicate(cleanTitle, sent)) continue;
+
+      // Check semantic duplication against all previously accepted sentences in show more
+      const sentRepeatedInResult = allAcceptedSentences.some(prevSent => areSentencesSemanticallyDuplicate(prevSent, sent));
       if (sentRepeatedInResult) continue;
 
-      nonDupSentences.push(sent);
+      const cleanSent = stripTrailingPublisherAttribution(cleanOrphanedConjunctions(sent.trim()));
+      if (cleanSent.length < 15) continue;
+
+      nonDupSentences.push(cleanSent);
+      allAcceptedSentences.push(cleanSent);
     }
 
     if (nonDupSentences.length === 0) continue;
 
-    const cleanP = cleanCitationGrammarGlitches(cleanQuotesAndFormatting(nonDupSentences.join(' ')));
+    let cleanP = stripTrailingPublisherAttribution(
+      cleanCitationGrammarGlitches(cleanQuotesAndFormatting(nonDupSentences.join(' ')))
+    );
+    cleanP = cleanOrphanedConjunctions(cleanP);
+    if (calculateJaccardSimilarity(cleanP, cleanTitle) >= 0.75) continue;
+    if (calculateJaccardSimilarity(cleanP, cleanSummary) >= 0.75) continue;
     const wordsInP = cleanP.split(/\s+/).filter(Boolean).length;
 
     // High information density target: up to 350 substantive words across up to 4 paragraphs
@@ -1374,8 +1670,9 @@ export function synthesizeLocalFallback(
   const now = new Date().getTime();
   const cutoff = now - timeframeHours * 60 * 60 * 1000;
 
-  // Filter items by timeframe
+  // Filter items by timeframe and discard junk/placeholder feeds
   const freshItems = items.filter(item => {
+    if (isJunkOrPlaceholderItem(item.title, item.description, item.sourceName)) return false;
     const itemTime = new Date(item.pubDate).getTime();
     return itemTime >= cutoff;
   }).sort((a, b) => new Date(b.pubDate).getTime() - new Date(a.pubDate).getTime());
@@ -1441,10 +1738,10 @@ export function synthesizeLocalFallback(
       });
     });
 
-    const cleanTitle = cleanCitationGrammarGlitches(stripHtml(cleanLiveblogAndRoundupArtifacts(applyReplacements(mainItem.title, rules))));
+    const cleanTitle = stripPublisherSuffix(cleanCitationGrammarGlitches(stripHtml(cleanLiveblogAndRoundupArtifacts(applyReplacements(mainItem.title, rules)))));
     const rawMainDescClean = cleanLiveblogAndRoundupArtifacts(mainItem.description || '');
     const rawMainDesc = applyReplacements(rawMainDescClean, rules);
-    const cleanSummary = cleanCitationGrammarGlitches(formatConciseSummary(rawMainDesc));
+    let cleanSummary = cleanCitationGrammarGlitches(formatConciseSummary(rawMainDesc, cleanTitle));
 
     // Collect descriptions across cluster items WITHOUT prepending titles
     const allClusterTexts = cluster.items
@@ -1462,16 +1759,30 @@ export function synthesizeLocalFallback(
         if (
           trimmed.length > 18 &&
           !isJunkOrMetadataParagraph(trimmed) &&
-          !uniqueSentences.some(u => u.toLowerCase().includes(trimmed.toLowerCase().slice(0, 30)))
+          !areSentencesSemanticallyDuplicate(trimmed, cleanTitle) &&
+          !uniqueSentences.some(u => areSentencesSemanticallyDuplicate(u, trimmed))
         ) {
           uniqueSentences.push(trimmed);
         }
       });
     });
 
+    // If summary is empty or identical to title, extract first distinct sentence from uniqueSentences
+    if (!cleanSummary || cleanSummary.toLowerCase() === cleanTitle.toLowerCase()) {
+      for (const s of uniqueSentences) {
+        const formatted = formatConciseSummary(s, cleanTitle);
+        if (formatted && formatted.toLowerCase() !== cleanTitle.toLowerCase() && formatted.length >= 25) {
+          cleanSummary = formatted;
+          break;
+        }
+      }
+    }
+
     const detailParagraphs: string[] = [];
     let currentChunk: string[] = [];
     uniqueSentences.forEach((sent, sIdx) => {
+      // Don't include the exact summary sentence in details
+      if (cleanSummary && areSentencesSemanticallyDuplicate(cleanSummary, sent)) return;
       currentChunk.push(sent);
       if (currentChunk.length >= 2 || sIdx === uniqueSentences.length - 1) {
         detailParagraphs.push(currentChunk.join(' '));
@@ -1528,7 +1839,7 @@ export function synthesizeLocalFallback(
       topicTag,
       matchedTopic,
     };
-  }).filter(art => Boolean(art.title && art.title.trim().length > 0));
+  }).filter(art => Boolean(art.title && art.title.trim().length >= 15 && !isJunkOrPlaceholderItem(art.title, art.summary)));
 
   // Prioritize 'Following' articles, balance neutral articles, and place 'Occasional' articles lower
   initialSynthesized.sort((a, b) => {

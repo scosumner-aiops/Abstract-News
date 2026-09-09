@@ -2,7 +2,7 @@ import React, { useState } from 'react';
 import { Layers, Clock, ExternalLink, Tag, Plus, Minus, BookOpen, TrendingUp, SlidersHorizontal } from 'lucide-react';
 import { ReplacementRule, SynthesizedArticle } from '../types';
 import { ImageCarousel } from './ImageCarousel';
-import { stripHtml, formatConciseSummary, ensureParagraphBreaks, sanitizeArticleDetailsParagraphs } from '../utils/rss';
+import { stripHtml, formatConciseSummary, ensureParagraphBreaks, sanitizeArticleDetailsParagraphs, stripPublisherSuffix, stripEditorialPrefixes } from '../utils/rss';
 
 interface ArticleCardProps {
   article: SynthesizedArticle;
@@ -38,10 +38,12 @@ export const ArticleCard: React.FC<ArticleCardProps> = ({
     }
   };
 
-  const cleanTitle = stripHtml(article.title);
-  const cleanSummary = formatConciseSummary(article.summary);
+  const cleanTitle = stripPublisherSuffix(stripEditorialPrefixes(stripHtml(article.title)));
+  const cleanSummary = formatConciseSummary(article.summary, cleanTitle);
   const rawDetails = article.fullDetails || '';
   const detailsParagraphs = sanitizeArticleDetailsParagraphs(rawDetails, cleanTitle, cleanSummary);
+  const displaySummary = cleanSummary || (detailsParagraphs.length > 0 ? detailsParagraphs[0] : '');
+  const displayDetails = cleanSummary ? detailsParagraphs : detailsParagraphs.slice(1);
 
   return (
     <article className="bg-slate-800/50 hover:bg-slate-800/70 border border-slate-800 hover:border-slate-700/80 transition-all duration-200 rounded-2xl p-5 shadow-lg flex flex-col justify-between group">
@@ -128,9 +130,11 @@ export const ArticleCard: React.FC<ArticleCardProps> = ({
           {/* Story Text & Details Column */}
           <div className="flex-1 min-w-0 md:order-1">
             {/* Summary Content */}
-            <p className="text-sm sm:text-[15px] text-slate-300 leading-relaxed font-normal">
-              {cleanSummary}
-            </p>
+            {displaySummary && (
+              <p className="text-sm sm:text-[15px] text-slate-300 leading-relaxed font-normal">
+                {displaySummary}
+              </p>
+            )}
 
             {/* Expandable Full Article Details */}
             {isExpanded && (
@@ -140,8 +144,8 @@ export const ArticleCard: React.FC<ArticleCardProps> = ({
                   <span>Additional Coverage</span>
                 </div>
                 <div className="space-y-2.5 text-slate-200 text-sm leading-relaxed font-normal">
-                  {detailsParagraphs.length > 0 ? (
-                    detailsParagraphs.map((paragraph, pIdx) => (
+                  {displayDetails.length > 0 ? (
+                    displayDetails.map((paragraph, pIdx) => (
                       <p key={pIdx} className="text-slate-300">
                         {paragraph}
                       </p>

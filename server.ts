@@ -185,7 +185,13 @@ import {
   splitIntoSentences,
   isJunkOrMetadataParagraph,
   sanitizeArticleDetailsParagraphs,
-  hasSufficientArticleDetails
+  hasSufficientArticleDetails,
+  stripPublisherSuffix,
+  stripEditorialPrefixes,
+  stripTrailingPublisherAttribution,
+  cleanOrphanedConjunctions,
+  isJunkOrPlaceholderItem,
+  areSentencesSemanticallyDuplicate
 } from './src/utils/rss';
 import { RawNewsItem, ReplacementRule, SynthesizedArticle, TopicPreference } from './src/types';
 import { isNonEnglishText } from './src/utils/language';
@@ -280,7 +286,7 @@ app.set('trust proxy', 1);
           topicPreferences: DEFAULT_TOPIC_PREFERENCES,
           timeframeValue: '24',
           showImages: true,
-          selectedModel: 'gemini-3.5-lite',
+          selectedModel: 'gemini-3.5-flash-lite',
           primarySourceId: 'none',
           updatedAt: new Date().toISOString(),
         });
@@ -307,7 +313,7 @@ app.set('trust proxy', 1);
       topicPreferences: DEFAULT_TOPIC_PREFERENCES,
       timeframeValue: '24',
       showImages: true,
-      selectedModel: 'gemini-3.5-lite',
+      selectedModel: 'gemini-3.5-flash-lite',
       primarySourceId: 'none',
     };
   }
@@ -1225,32 +1231,41 @@ Preserve news accuracy, key facts, proper nouns, and context.
 Return JSON with a "translations" array containing objects with "id", "title", and "description".`;
 
       try {
-        const res = await ai.models.generateContent({
-          model: 'gemini-3.1-flash-lite',
-          contents: prompt + '\n\nInput JSON:\n' + JSON.stringify(payload),
-          config: {
-            responseMimeType: 'application/json',
-            temperature: 0.1,
-            responseSchema: {
-              type: Type.OBJECT,
-              properties: {
-                translations: {
-                  type: Type.ARRAY,
-                  items: {
-                    type: Type.OBJECT,
-                    properties: {
-                      id: { type: Type.INTEGER },
-                      title: { type: Type.STRING },
-                      description: { type: Type.STRING },
+        let res: any = null;
+        const translationModels = ['gemini-3.5-flash-lite', 'gemini-2.5-flash-lite', 'gemini-2.5-flash'];
+        for (const modelName of translationModels) {
+          try {
+            res = await ai.models.generateContent({
+              model: modelName,
+              contents: prompt + '\n\nInput JSON:\n' + JSON.stringify(payload),
+              config: {
+                responseMimeType: 'application/json',
+                temperature: 0.1,
+                responseSchema: {
+                  type: Type.OBJECT,
+                  properties: {
+                    translations: {
+                      type: Type.ARRAY,
+                      items: {
+                        type: Type.OBJECT,
+                        properties: {
+                          id: { type: Type.INTEGER },
+                          title: { type: Type.STRING },
+                          description: { type: Type.STRING },
+                        },
+                        required: ['id', 'title', 'description'],
+                      },
                     },
-                    required: ['id', 'title', 'description'],
                   },
+                  required: ['translations'],
                 },
               },
-              required: ['translations'],
-            },
-          },
-        });
+            });
+            if (res && res.text) break;
+          } catch (mErr) {
+            // Continue to next model
+          }
+        }
 
         if (res && res.text) {
           const parsed = JSON.parse(res.text);
@@ -1541,7 +1556,8 @@ Return JSON with a "translations" array containing objects with "id", "title", a
   async function ensureArticlesInEnglish(
     articles: SynthesizedArticle[],
     ai: GoogleGenAI | null,
-    rules: ReplacementRule[]
+    rules: ReplacementRule[],
+    modelToUse: string = 'gemini-3.5-flash-lite'
   ): Promise<SynthesizedArticle[]> {
     const nonEnglishIndices: number[] = [];
     articles.forEach((art, idx) => {
@@ -1553,7 +1569,7 @@ Return JSON with a "translations" array containing objects with "id", "title", a
 
     if (nonEnglishIndices.length === 0) return articles;
 
-    console.log(`[Translation] Detected ${nonEnglishIndices.length} non-English article(s). Translating to English before publishing...`);
+    console.log(`[Translation] Detected ${nonEnglishIndices.length} non-English article(s). Translating to English with model ${modelToUse} before publishing...`);
 
     if (!ai) return articles;
 
@@ -1580,37 +1596,29 @@ Return valid JSON adhering strictly to:
   "fullDetails": "2-4 paragraphs with concrete facts and numbers in English"
 }`;
 
-          const translationModels = ['gemini-3.1-flash-lite', 'gemini-2.5-flash', 'gemini-3.5-flash-lite'];
-          let translatedText = '';
-
-          for (const modelName of translationModels) {
-            try {
-              const resp = await ai.models.generateContent({
-                model: modelName,
-                contents: prompt,
-                config: {
-                  responseMimeType: 'application/json',
-                  temperature: 0.1,
-                },
-              });
-              translatedText = resp.text || '';
-              if (translatedText) break;
-            } catch (mErr: any) {
-              // Try next model
-            }
-          }
+          const resp = await ai.models.generateContent({
+            model: modelToUse,
+            contents: prompt,
+            config: {
+              responseMimeType: 'application/json',
+              temperature: 0.1,
+            },
+          });
+          const translatedText = resp.text || '';
 
           if (!translatedText) return;
 
           const parsed = JSON.parse(translatedText);
           if (parsed.title) {
-            art.title = cleanCitationGrammarGlitches(stripHtml(cleanLiveblogAndRoundupArtifacts(applyReplacements(parsed.title, rules))));
+            art.title = stripPublisherSuffix(cleanCitationGrammarGlitches(stripHtml(cleanLiveblogAndRoundupArtifacts(applyReplacements(parsed.title, rules)))));
           }
           if (parsed.summary) {
-            art.summary = cleanCitationGrammarGlitches(cleanMediaAudioVideoJunk(formatConciseSummary(cleanLiveblogAndRoundupArtifacts(applyReplacements(parsed.summary, rules)))));
+            art.summary = cleanCitationGrammarGlitches(cleanMediaAudioVideoJunk(formatConciseSummary(cleanLiveblogAndRoundupArtifacts(applyReplacements(parsed.summary, rules)), art.title)));
           }
           if (parsed.fullDetails) {
-            art.fullDetails = cleanCitationGrammarGlitches(cleanMediaAudioVideoJunk(cleanLiveblogAndRoundupArtifacts(applyReplacements(parsed.fullDetails, rules))));
+            const rawP = cleanMediaAudioVideoJunk(cleanLiveblogAndRoundupArtifacts(applyReplacements(parsed.fullDetails, rules)));
+            const sanitizedP = sanitizeArticleDetailsParagraphs(rawP, art.title, art.summary);
+            art.fullDetails = cleanCitationGrammarGlitches(sanitizedP.join('\n\n'));
           }
           console.log(`[Translation] Successfully translated to English: "${art.title}"`);
         } catch (err: any) {
@@ -1663,10 +1671,15 @@ Return valid JSON adhering strictly to:
     }
   });
 
+  function resolveGeminiModelName(model?: string): string {
+    if (!model) return 'gemini-3.5-flash-lite';
+    return model.trim();
+  }
+
   // 3. Synthesize & Anonymize API Endpoint
   app.post('/api/synthesize', async (req, res) => {
     try {
-      const { items, rules = [], topics = [], timeframeHours = 24, selectedModel = 'gemini-3.5-lite', primarySourceName } = req.body as {
+      const { items, rules = [], topics = [], timeframeHours = 24, selectedModel = 'gemini-3.5-flash-lite', primarySourceName } = req.body as {
         items: RawNewsItem[];
         rules: ReplacementRule[];
         topics?: TopicPreference[];
@@ -1714,7 +1727,7 @@ Your task:
 
 3. MANDATORY ENGLISH TRANSLATION & PUBLISHING STANDARD (CRITICAL):
    - ALL synthesized articles (including 'title', 'summary', 'fullDetails', and 'category') MUST be written in fluent, natural, journalistic ENGLISH.
-   - If any input feed item or story is written in Portuguese (such as Globo G1), Spanish, French, German, Italian, Russian, Arabic, Chinese, Japanese, or ANY language other than English, YOU MUST ACCURATELY AND COMPLETELY TRANSLATE AND SYNTHESIZE IT ENTIRELY INTO CLEAR, FLUENT ENGLISH.
+   - If any input feed item or story is written in French, Portuguese (such as Globo G1), Spanish, German, Italian, Russian, Arabic, Chinese, Japanese, or ANY language other than English, YOU MUST ACCURATELY AND COMPLETELY TRANSLATE AND SYNTHESIZE IT ENTIRELY INTO CLEAR, FLUENT ENGLISH.
    - You are STRICTLY FORBIDDEN from publishing foreign language headlines, summaries, or details. All output stories must be translated into English before publishing.
 
 4. SIMPLIFIED, DIRECT LANGUAGE & HIGH-DENSITY REPORTING (CRITICAL):
@@ -1724,10 +1737,10 @@ Your task:
       - ELIMINATE EMPTY FILLER AND JOURNALISTIC CLICHES: Do NOT use phrases like "In a dramatic turn of events", "This development comes as", "It remains to be seen", "Observers note that", "Highlighting the broader significance", "Against the backdrop of", "Taking center stage", "Amid growing tensions".
       - State facts, actions, and consequences plainly without preamble or decorative fluff.
 
-   b. SUMMARY CARD: CONCISE, PUNCHY, AND TO THE POINT:
+   b. SUMMARY CARD: CONCISE, PUNCHY, AND NEVER REPEATING THE HEADLINE (CRITICAL):
       - 'summary' MUST be a crisp 1 to 2 sentence executive card (approx 25 to 45 words).
       - Directly state: Who did what, where, and the immediate outcome.
-      - Zero fluff, zero preamble, zero wordiness.
+      - STRICT ZERO-REPETITION: Never repeat or echo the headline in the summary! The summary must provide the immediate factual expansion (actions taken, casualty or financial figures, policy effect).
 
    c. 'SHOW MORE' (fullDetails): MORE FACTS AND INSIGHTS, NOT MORE WORDS:
       - Focus on high factual density rather than word volume. Do NOT pad with fluff, wordy exposition, or repetitive restatements.
@@ -1748,7 +1761,7 @@ Your task:
       - NO METADATA OR CAPTIONS: Never include photo credits, time stamps, or isolated subheadings.
       - NO GENERIC FILLER OR SOURCE EXPLANATIONS: Do not include meta-comments explaining the synthesis or pointing to sources. End naturally with concrete facts.
 
-4. TARGETED REPLACEMENT RULES & MANDATORY NAMING OF ALL NON-RESTRICTED ENTITIES (CRITICAL):
+5. TARGETED REPLACEMENT RULES & MANDATORY NAMING OF ALL NON-RESTRICTED ENTITIES (CRITICAL):
    a. STRICT TARGETED REPLACEMENTS & FLAWLESS GRAMMATICAL INTEGRATION:
       You MUST ONLY replace terms that match the following specific forbidden rules:
 ${activeRules.map(r => `      * Replace: "${r.term}" -> With: "${r.replacement}"`).join('\n')}
@@ -1778,10 +1791,10 @@ ${activeRules.map(r => `      * Replace: "${r.term}" -> With: "${r.replacement}"
       - Having a subject on the citation anonymizer list, or having an associated image filtered out or removed, is ABSOLUTELY NOT A REASON TO NOT PUBLISH THE ARTICLE.
       - Every relevant story must be published, regardless of whether its imagery is suppressed or absent. You simply do not show any images that show that rule.
 
-5. Plain Text Formatting:
+6. Plain Text Formatting:
    You MUST NEVER output HTML tags (such as <p>, <a>, <div>, <br>, <span>) anywhere in returned title, summary, or fullDetails fields. All text must be clean, readable plain text.
 
-6. Return valid JSON adhering strictly to the schema provided.
+7. Return valid JSON adhering strictly to the schema provided.
 Include "matchedItemIds" as an array of numerical IDs corresponding ONLY to input items that report on that EXACT same specific story.`;
 
           if (activeTopics.length > 0) {
@@ -1803,62 +1816,50 @@ ${seeLessTopics.map(t => `  * "${t}": De-emphasize and downweight coverage on th
 - BLENDING RULE: For each anchored story from "${primarySourceName}", you must search the rest of the news items (from all other sources) to find entries reporting on the same or related story. You should merge, integrate, and blend their developments, facts, or context into this story. Add those other sources to the "sources" list of the article, and include their input IDs in "matchedItemIds".`;
           }
 
-          const primaryModel = selectedModel || 'gemini-3.5-lite';
-          const secondaryModel = primaryModel === 'gemini-3.5-lite' ? 'gemini-3.1-flash-lite' : 'gemini-3.5-lite';
-          const modelsToTry = [primaryModel, secondaryModel];
-          let response: any = null;
+          const modelToUse = resolveGeminiModelName(selectedModel);
+          console.log(`[Deep Log - Synthesis Start] Generating synthesis using model: ${modelToUse} for ${items.length} items (timeframe: ${timeframeHours}h), ${activeRules.length} active rules, ${activeTopics.length} topic preferences`);
 
-          for (const modelName of modelsToTry) {
-            try {
-              response = await ai.models.generateContent({
-                model: modelName,
-                contents: JSON.stringify(payload),
-                config: {
-                  systemInstruction,
-                  responseMimeType: 'application/json',
-                  temperature: 0.1,
-                  responseSchema: {
-                    type: Type.OBJECT,
-                    properties: {
-                      articles: {
-                        type: Type.ARRAY,
-                        description: 'At most 20 synthesized news articles',
-                        items: {
-                          type: Type.OBJECT,
-                          properties: {
-                            title: { type: Type.STRING, description: 'Direct, crisp headline without forbidden citations' },
-                            summary: { type: Type.STRING, description: 'Direct 1-2 sentence executive summary (25-45 words) in plain, simple English. Strictly to the point: who did what, where, and the immediate outcome. Zero filler.' },
-                            fullDetails: { type: Type.STRING, description: 'High-density factual breakdown in 2 to 4 tight, substantive paragraphs (180-300 words total) separated by double linebreaks. Focus on MORE FACTS and INSIGHTS (concrete figures, dates, verified quotes, underlying drivers, next milestones), NOT MORE WORDS. Zero filler, and strictly NO repetition of the headline or summary.' },
-                            sources: { type: Type.ARRAY, items: { type: Type.STRING }, description: 'Names of news sources covering this story' },
-                            category: { type: Type.STRING, description: 'Category like World, Tech, Politics, Business' },
-                            matchedItemIds: { type: Type.ARRAY, items: { type: Type.INTEGER }, description: 'List of matching input item IDs' },
-                            topicTag: { type: Type.STRING, description: 'Must be "Following" if this story covers a boosted topic, "Occasional" if it covers a de-prioritized topic, or empty string if neutral' },
-                            matchedTopic: { type: Type.STRING, description: 'The exact matched topic name if topicTag is Following or Occasional, else empty string' },
-                          },
-                          required: ['title', 'summary', 'fullDetails', 'sources', 'matchedItemIds'],
-                        },
+          const response = await ai.models.generateContent({
+            model: modelToUse,
+            contents: JSON.stringify(payload),
+            config: {
+              systemInstruction,
+              responseMimeType: 'application/json',
+              temperature: 0.1,
+              responseSchema: {
+                type: Type.OBJECT,
+                properties: {
+                  articles: {
+                    type: Type.ARRAY,
+                    description: 'At most 20 synthesized news articles',
+                    items: {
+                      type: Type.OBJECT,
+                      properties: {
+                        title: { type: Type.STRING, description: 'Direct, crisp headline without forbidden citations' },
+                        summary: { type: Type.STRING, description: 'Direct 1-2 sentence executive summary (25-45 words) in plain, simple English. Strictly to the point: who did what, where, and the immediate outcome. Zero filler.' },
+                        fullDetails: { type: Type.STRING, description: 'High-density factual breakdown in 2 to 4 tight, substantive paragraphs (180-300 words total) separated by double linebreaks. Focus on MORE FACTS and INSIGHTS (concrete figures, dates, verified quotes, underlying drivers, next milestones), NOT MORE WORDS. Zero filler, and strictly NO repetition of the headline or summary.' },
+                        sources: { type: Type.ARRAY, items: { type: Type.STRING }, description: 'Names of news sources covering this story' },
+                        category: { type: Type.STRING, description: 'Category like World, Tech, Politics, Business' },
+                        matchedItemIds: { type: Type.ARRAY, items: { type: Type.INTEGER }, description: 'List of matching input item IDs' },
+                        topicTag: { type: Type.STRING, description: 'Must be "Following" if this story covers a boosted topic, "Occasional" if it covers a de-prioritized topic, or empty string if neutral' },
+                        matchedTopic: { type: Type.STRING, description: 'The exact matched topic name if topicTag is Following or Occasional, else empty string' },
                       },
+                      required: ['title', 'summary', 'fullDetails', 'sources', 'matchedItemIds'],
                     },
-                    required: ['articles'],
                   },
                 },
-              });
-              if (response && response.text) break;
-            } catch (err: any) {
-              const errMsg = (err?.message || err?.toString() || '').toLowerCase();
-              if (errMsg.includes('429') || errMsg.includes('quota') || errMsg.includes('resource_exhausted')) {
-                // Rate limit hit for model, continue to fallback model
-                continue;
-              }
-              break;
-            }
-          }
+                required: ['articles'],
+              },
+            },
+          });
 
           if (response && response.text) {
             const jsonText = response.text;
+            console.log(`[Deep Log - Gemini Response] Received response length=${jsonText.length} bytes`);
             const parsed = JSON.parse(jsonText);
 
             if (parsed && Array.isArray(parsed.articles)) {
+              console.log(`[Deep Log - Gemini Articles] Received ${parsed.articles.length} raw synthesized articles from Gemini`);
               const synthesizedArticles: SynthesizedArticle[] = parsed.articles.slice(0, 25).map((art: any, idx: number) => {
                 const matchedIds: number[] = art.matchedItemIds || [];
                 const matchedItems = matchedIds.map(id => sortedItems[id]).filter(Boolean);
@@ -1881,16 +1882,29 @@ ${seeLessTopics.map(t => `  * "${t}": De-emphasize and downweight coverage on th
                   url: item.link,
                 })).filter((link, i, self) => i === self.findIndex(l => l.url === link.url));
 
-                // Clean title, summary, and fullDetails extra safeguard with local replacement and HTML stripping
-                const cleanTitle = cleanCitationGrammarGlitches(stripHtml(cleanLiveblogAndRoundupArtifacts(applyReplacements(art.title, rules))));
-                let cleanSummary = cleanCitationGrammarGlitches(cleanMediaAudioVideoJunk(formatConciseSummary(cleanLiveblogAndRoundupArtifacts(applyReplacements(art.summary, rules)))));
-                if (!cleanSummary && matchedItems.length > 0) {
-                  const firstDesc = cleanMediaAudioVideoJunk(stripHtml(matchedItems[0].description || ''));
-                  cleanSummary = cleanCitationGrammarGlitches(firstDesc ? splitIntoSentences(firstDesc)[0] || cleanTitle : cleanTitle);
+                // Clean title, summary, and fullDetails with strict non-duplication enforcement
+                const cleanTitle = stripPublisherSuffix(stripEditorialPrefixes(cleanCitationGrammarGlitches(stripHtml(cleanLiveblogAndRoundupArtifacts(applyReplacements(art.title, rules))))));
+                let cleanSummary = cleanOrphanedConjunctions(cleanCitationGrammarGlitches(cleanMediaAudioVideoJunk(formatConciseSummary(cleanLiveblogAndRoundupArtifacts(applyReplacements(art.summary, rules)), cleanTitle))));
+
+                // If summary is empty or duplicate of title, extract fresh sentence from matched items
+                if (!cleanSummary || areSentencesSemanticallyDuplicate(cleanSummary, cleanTitle)) {
+                  for (const m of matchedItems) {
+                    const descText = cleanMediaAudioVideoJunk(stripHtml(cleanLiveblogAndRoundupArtifacts(applyReplacements(m.description || '', rules))));
+                    const sents = splitIntoSentences(descText);
+                    const nonDup = sents.find(s => s.length >= 25 && !areSentencesSemanticallyDuplicate(s, cleanTitle));
+                    if (nonDup) {
+                      cleanSummary = cleanOrphanedConjunctions(cleanCitationGrammarGlitches(formatConciseSummary(nonDup, cleanTitle)));
+                      break;
+                    }
+                  }
+                  if (!cleanSummary || areSentencesSemanticallyDuplicate(cleanSummary, cleanTitle)) {
+                    cleanSummary = formatConciseSummary(art.summary || '', cleanTitle);
+                  }
                 }
-                const rawFullText = art.fullDetails ? cleanMediaAudioVideoJunk(applyReplacements(art.fullDetails, rules)) : '';
+
+                const rawFullText = art.fullDetails ? cleanMediaAudioVideoJunk(cleanLiveblogAndRoundupArtifacts(applyReplacements(art.fullDetails, rules))) : '';
                 const sanitizedP = sanitizeArticleDetailsParagraphs(rawFullText, cleanTitle, cleanSummary);
-                let cleanFullDetails = cleanCitationGrammarGlitches(sanitizedP.join('\n\n'));
+                let cleanFullDetails = cleanOrphanedConjunctions(cleanCitationGrammarGlitches(sanitizedP.join('\n\n')));
 
                 // Guarantee proper minimum length and multi-paragraph coverage for fullDetails without title/summary repetition
                 if (cleanFullDetails.trim().length < 200) {
@@ -1906,7 +1920,9 @@ ${seeLessTopics.map(t => `  * "${t}": De-emphasize and downweight coverage on th
                       if (
                         trimmed.length > 20 &&
                         !isJunkOrMetadataParagraph(trimmed) &&
-                        !extraSentences.some(e => e.toLowerCase().includes(trimmed.toLowerCase().slice(0, 30)))
+                        !areSentencesSemanticallyDuplicate(trimmed, cleanTitle) &&
+                        !areSentencesSemanticallyDuplicate(trimmed, cleanSummary) &&
+                        !extraSentences.some(e => areSentencesSemanticallyDuplicate(e, trimmed))
                       ) {
                         extraSentences.push(trimmed);
                       }
@@ -1923,12 +1939,24 @@ ${seeLessTopics.map(t => `  * "${t}": De-emphasize and downweight coverage on th
                         chunk = [];
                       }
                     });
-                    const extraSanitized = sanitizeArticleDetailsParagraphs(extraParagraphs.join('\n\n'), cleanTitle, cleanSummary);
+                    const combinedDetails = cleanFullDetails
+                      ? `${cleanFullDetails}\n\n${extraParagraphs.join('\n\n')}`
+                      : extraParagraphs.join('\n\n');
+                    const extraSanitized = sanitizeArticleDetailsParagraphs(combinedDetails, cleanTitle, cleanSummary);
                     if (extraSanitized.length > 0) {
-                      cleanFullDetails = cleanCitationGrammarGlitches(extraSanitized.join('\n\n'));
+                      cleanFullDetails = cleanOrphanedConjunctions(cleanCitationGrammarGlitches(extraSanitized.join('\n\n')));
                     }
                   }
                 }
+
+                const isJunk = isJunkOrPlaceholderItem(cleanTitle, cleanSummary);
+                console.log(`[Deep Log - Article #${idx + 1}]
+  * Title: "${cleanTitle}"
+  * Summary: "${cleanSummary}"
+  * Raw Details Words: ${rawFullText.split(/\s+/).filter(Boolean).length}, Sanitized Paragraphs: ${sanitizedP.length}
+  * Final Details Length: ${cleanFullDetails.length} chars
+  * Sources: ${(art.sources || []).join(', ')} (${matchedItems.length} matched feeds)
+  * Status: ${!isJunk && cleanTitle.length >= 15 ? 'ACCEPTED' : 'DROPPED (Junk or short title)'}`);
 
                 const latestTimestamp = matchedItems.length > 0
                   ? matchedItems[0].pubDate
@@ -1952,10 +1980,11 @@ ${seeLessTopics.map(t => `  * "${t}": De-emphasize and downweight coverage on th
                   topicTag,
                   matchedTopic: topicTag ? matchedTopic : undefined,
                 };
-              }).filter(art => Boolean(art.title && art.title.trim().length > 0));
+              }).filter(art => Boolean(art.title && art.title.trim().length >= 15 && !isJunkOrPlaceholderItem(art.title, art.summary)));
 
               // Apply post-synthesis duplicate merging pass to combine any remaining overlapping topics
               const deduplicatedArticles = mergeDuplicateSynthesizedArticles(synthesizedArticles).slice(0, 25);
+              console.log(`[Deep Log - Synthesis Complete] Successfully synthesized and deduplicated ${deduplicatedArticles.length} final articles`);
 
               // Sort articles: boosted 'Following' stories first, then neutral stories, then 'Occasional' stories
               deduplicatedArticles.sort((a, b) => {
@@ -1980,24 +2009,19 @@ ${seeLessTopics.map(t => `  * "${t}": De-emphasize and downweight coverage on th
               });
               return;
             }
-          } else {
-            console.log('Gemini API quota or rate limit reached; using local synthesis engine.');
+            throw new Error(`Model ${modelToUse} returned invalid JSON: articles array missing`);
           }
+          throw new Error(`Model ${modelToUse} returned empty response`);
         } catch (aiError: any) {
-          console.log('Gemini API notice, seamlessly executing local synthesis fallback.');
+          console.error(`[Synthesis Error]:`, aiError);
+          const msg = aiError?.message || (typeof aiError === 'string' ? aiError : 'Gemini AI synthesis failed');
+          res.status(500).json({ error: msg });
+          return;
         }
+      } else {
+        res.status(500).json({ error: 'Gemini AI client is not available. Please verify your GEMINI_API_KEY.' });
+        return;
       }
-
-      // Fallback local engine
-      const fallbackArticles = synthesizeLocalFallback(items, rules, timeframeHours, primarySourceName, topics);
-      const englishFallbackArticles = ai ? await ensureArticlesInEnglish(fallbackArticles, ai, rules) : fallbackArticles;
-      await ensureImagesForArticles(englishFallbackArticles, rules);
-      const cleanFallbackArticles = await filterArticleImagesWithVision(englishFallbackArticles, rules, ai);
-      res.json({
-        articles: cleanFallbackArticles,
-        isAI: false,
-        timestamp: new Date().toISOString(),
-      });
     } catch (error: any) {
       console.error('Error in /api/synthesize:', error);
       res.status(500).json({ error: error.message || 'Synthesize operation failed' });

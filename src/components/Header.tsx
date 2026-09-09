@@ -68,17 +68,20 @@ export const Header: React.FC<HeaderProps> = ({
           <div className="flex items-center space-x-1 bg-slate-800/80 border border-indigo-900/60 hover:border-indigo-700/80 rounded-xl px-2 py-1.5 text-indigo-200 transition flex-shrink-0 shadow-xs">
             <Cpu className="w-4 h-4 text-indigo-400 flex-shrink-0" />
             <select
-              value={selectedModel}
+              value={selectedModel === 'gemini-3.5-lite' ? 'gemini-3.5-flash-lite' : selectedModel}
               onChange={(e) => onModelChange(e.target.value)}
               className="bg-transparent text-xs font-semibold text-slate-200 focus:outline-none cursor-pointer pr-0.5"
               title="Select Gemini AI Model for processing news streams"
               aria-label="Select Gemini AI Model"
             >
-              <option value="gemini-3.5-lite" className="bg-slate-900 text-slate-100">
+              <option value="gemini-3.5-flash-lite" className="bg-slate-900 text-slate-100">
                 Gemini 3.5 Lite (Default)
               </option>
-              <option value="gemini-3.1-flash-lite" className="bg-slate-900 text-slate-100">
-                Gemini 3.1 Flash Lite
+              <option value="gemini-2.5-flash" className="bg-slate-900 text-slate-100">
+                Gemini 2.5 Flash
+              </option>
+              <option value="gemini-2.5-flash-lite" className="bg-slate-900 text-slate-100">
+                Gemini 2.5 Flash Lite
               </option>
             </select>
           </div>

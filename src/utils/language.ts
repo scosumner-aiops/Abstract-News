@@ -34,7 +34,12 @@ const FRENCH_WORDS = new Set([
   'selon', 'depuis', 'pendant', 'devant', 'derrière', 'mais', 'donc', 'que', 'qui',
   'quoi', 'dont', 'où', 'quand', 'comment', 'pourquoi', 'très', 'trop', 'aussi',
   'encore', 'toujours', 'jamais', 'rien', 'tout', 'tous', 'toute', 'toutes',
-  'gouvernement', 'président', 'pays', 'ville', 'a', 'été', 'ont', 'sont', 'est'
+  'gouvernement', 'président', 'pays', 'ville', 'a', 'été', 'ont', 'sont', 'est',
+  'guerre', 'commerciale', 'malgré', 'santé', 'ministre', 'premier', 'première',
+  'après', 'avant', 'faire', 'fait', 'dit', 'disent', 'leur', 'leurs', 'comme',
+  'si', 'lui', 'elle', 'elles', 'ils', 'nous', 'vous', 'deux', 'trois', 'ans',
+  'année', 'années', 'jour', 'jours', 'monde', 'national', 'nationale', 'états',
+  'unis', 'américain', 'américaine', 'canadien', 'canadienne', 'québec', 'presse'
 ]);
 
 const GERMAN_WORDS = new Set([

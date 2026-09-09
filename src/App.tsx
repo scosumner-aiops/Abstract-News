@@ -5,7 +5,7 @@ import { ArticleCard } from './components/ArticleCard';
 import { ArticleSkeleton } from './components/ArticleSkeleton';
 import { ConfigModal } from './components/ConfigModal';
 import { NewsSource, ReplacementRule, SynthesizedArticle, RawNewsItem, UserProfile, TopicPreference } from './types';
-import { synthesizeLocalFallback, hasSufficientArticleDetails, cleanMediaAudioVideoJunk, stripHtml } from './utils/rss';
+import { hasSufficientArticleDetails, cleanMediaAudioVideoJunk, stripHtml } from './utils/rss';
 import { DEFAULT_SOURCES, DEFAULT_RULES, DEFAULT_TOPIC_PREFERENCES } from './utils/defaultSettings';
 import { AlertCircle, RefreshCw, Sliders, ChevronDown, Square, Newspaper, Anchor } from 'lucide-react';
 
@@ -132,7 +132,9 @@ export default function App() {
   });
 
   const [selectedModel, setSelectedModel] = useState<string>(() => {
-    return localStorage.getItem('an_selected_model') || 'gemini-3.5-lite';
+    const saved = localStorage.getItem('an_selected_model');
+    if (saved === 'gemini-3.5-lite') return 'gemini-3.5-flash-lite';
+    return saved || 'gemini-3.5-flash-lite';
   });
 
   const [primarySourceId, setPrimarySourceId] = useState<string>(() => {
@@ -626,23 +628,23 @@ export default function App() {
         signal: controller.signal,
       });
 
+      const synthResult = await synthRes.json();
       if (!synthRes.ok) {
-        throw new Error(`Synthesis request failed (${synthRes.status})`);
+        throw new Error(synthResult?.error || `Synthesis request failed (${synthRes.status})`);
       }
 
-      const synthResult = await synthRes.json();
       const rawSynth: SynthesizedArticle[] = synthResult.articles || [];
+      if (rawSynth.length === 0) {
+        throw new Error(synthResult?.error || 'AI synthesis returned no articles.');
+      }
 
       // Clean summaries and details to remove audio/video player text
-      const processedArticles = (rawSynth.length > 0
-        ? rawSynth
-        : synthesizeLocalFallback(rawItems, rules, timeframeHours, primarySourceId !== 'none' ? primarySourceName : undefined, topicPreferences)
-      ).map((art) => {
+      const processedArticles = rawSynth.map((art) => {
         const cleanSummary = cleanMediaAudioVideoJunk(stripHtml(art.summary || ''));
         const cleanDetails = art.fullDetails ? cleanMediaAudioVideoJunk(art.fullDetails) : undefined;
         return {
           ...art,
-          summary: cleanSummary || art.title,
+          summary: cleanSummary || '',
           fullDetails: cleanDetails,
         };
       });
@@ -739,7 +741,7 @@ export default function App() {
       setTopicPreferences(DEFAULT_TOPIC_PREFERENCES);
       setTimeframeValue('24');
       setShowImages(true);
-      setSelectedModel('gemini-3.5-lite');
+      setSelectedModel('gemini-3.5-flash-lite');
       setPrimarySourceId('none');
       localStorage.removeItem('an_sources_v5');
       localStorage.removeItem('an_rules_v2');
@@ -756,7 +758,7 @@ export default function App() {
               topicPreferences: DEFAULT_TOPIC_PREFERENCES,
               timeframeValue: '24',
               showImages: true,
-              selectedModel: 'gemini-3.5-lite',
+              selectedModel: 'gemini-3.5-flash-lite',
               primarySourceId: 'none',
             },
           }),
